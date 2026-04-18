@@ -1,0 +1,6 @@
+# Folder
+checkpoints/
+Datasets/
+log/
+results/
+__pycache__/
