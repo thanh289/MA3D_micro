@@ -56,16 +56,18 @@ To train on a specific dataset (e.g., RAF-DB):
 
 
 ```bash
-python train.py --data_type RAF-DB --batch_size 8 --resume_name checkpoint/rafdb_best.pth
+python train.py --data_type RAF-DB --batch_size 8 --resume_name checkpoints/rafdb_best.pth
 ```
 
 The `batch_size` can be scaled according to the available GPU resources. Using a larger batch size may lead to better performance. Training logs are saved in the `log` directory. Running the training multiple times is recommended to obtain optimal results.
 ## Testing
 
+If you want to use our pre-trained model, you can download the best checkpoint [here](https://drive.google.com/drive/folders/10tltNSB009VoalxTo46IUMpQhPANudhF?usp=drive_link) and place it into the `checkpoints/` directory.
+
 To evaluate on a specific dataset (e.g., RAF-DB), run:
 
 ```bash
-python test.py --data_type RAF-DB --ckpt_path checkpoint/rafdb_best.pth
+python test.py --data_type RAF-DB --ckpt_path checkpoints/rafdb_best.pth
 ```
 
 ## Visualization
