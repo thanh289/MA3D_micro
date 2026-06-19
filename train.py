@@ -10,6 +10,11 @@ from engine import train_one_epoch, validate
 import time
 import argparse
 
+import wandb
+
+
+
+
 def get_args():
     parser = argparse.ArgumentParser("SFER Training")
 
@@ -32,6 +37,14 @@ def get_args():
     parser.add_argument("--resume_name", type=str, default="last.pth")
     parser.add_argument("--resume", action="store_true")
 
+    # Weights & Biases
+    parser.add_argument("--use_wandb", action="store_true", help="turn on wandb logging")
+    parser.add_argument("--wandb_project", type=str, default="MA3D-micro", help="project name in wandb")
+    parser.add_argument("--wandb_entity", type=str, default=None, help="team/entity name in wandb, or default")
+    parser.add_argument("--wandb_run_name", type=str, default=None, help="run name in wandb")
+    parser.add_argument("--wandb_mode", type=str, default="online", choices=["online", "offline", "disabled"])
+    parser.add_argument("--wandb_watch_model", action="store_true", help="Log gradients/weights histogram")
+
     return parser.parse_args()
 
 def main():
@@ -41,7 +54,21 @@ def main():
     os.makedirs(args.resume_dir, exist_ok=True)
     resume_path = os.path.join(args.resume_dir, args.resume_name)
 
-    # Logging setup
+    # ---- Weights & Biases setup ----
+    use_wandb = args.use_wandb
+    if use_wandb:
+        run_name = args.wandb_run_name or f"{args.data_type}_{time.strftime('%Y%m%d_%H%M%S')}"
+        wandb.init(
+            project=args.wandb_project,
+            entity=args.wandb_entity,
+            name=run_name,
+            mode=args.wandb_mode,
+            config=vars(args),
+        )
+        # add epoch as a global step metric for better visualization in wandb
+        wandb.define_metric("epoch")
+        wandb.define_metric("*", step_metric="epoch")
+
     log_f = None
     if args.log_file is not None:
         os.makedirs("log", exist_ok=True)
@@ -59,8 +86,11 @@ def main():
 
     train_loader, val_loader = get_dataloaders(args)
 
-
     model = MA3D(num_classes= args.num_classes).to(device)
+
+    if use_wandb and args.wandb_watch_model:
+        wandb.watch(model, log="all", log_freq=100)
+
     CE_criterion = torch.nn.CrossEntropyLoss()
     lsce_criterion = LabelSmoothingCrossEntropy(smoothing=0.2)
     MA_criterion = MarginAwareCELoss().to(device)
@@ -98,6 +128,20 @@ def main():
 
         epoch_time = (time.time() - epoch_start_time) / 60.0
 
+        is_best = val_acc > best_val_acc
+
+        if use_wandb:
+            wandb.log({
+                "epoch": epoch + 1,
+                "lr": lr,
+                "train/loss": train_loss,
+                "train/acc": train_acc,
+                "val/loss": val_loss,
+                "val/acc": val_acc,
+                "epoch_time_min": epoch_time,
+                "best_val_acc": best_val_acc if not is_best else val_acc,
+            })
+
         if log_f is not None:
             log_f.write(
                 f"{epoch + 1:^6d} {lr:^12.8f} {train_loss:^12.4f} {train_acc * 100:^10.2f} "
@@ -105,7 +149,7 @@ def main():
             )
             log_f.flush()
 
-        if val_acc > best_val_acc:
+        if is_best:
             print(f"epoch: {epoch + 1}, val_acc: {val_acc * 100:.2f}%")
             best_val_acc = val_acc
             torch.save({
@@ -115,6 +159,10 @@ def main():
                 "scheduler": scheduler.state_dict(),
                 "best_val_acc": best_val_acc,
             }, resume_path)
+
+            if use_wandb:
+                wandb.run.summary["best_val_acc"] = best_val_acc
+                wandb.run.summary["best_epoch"] = epoch + 1
 
             if log_f is not None:
                 log_f.write(
@@ -126,6 +174,10 @@ def main():
     if log_f is not None:
         log_f.write(f"\nBest validation accuracy: {best_val_acc * 100:.2f}%")
         log_f.close()
+
+    if use_wandb:
+        wandb.finish()
+
 
 if __name__ == "__main__":
     main()
