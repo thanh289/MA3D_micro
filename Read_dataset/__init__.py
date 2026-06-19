@@ -3,4 +3,5 @@ from .VKIST_3087 import VKIST_Dataset
 from .DatasetCheo import DatasetCheo
 from .FER_Plus import FERPlusDataset
 from .Caers import CaersDataset
+from .FourDME import FourDME_Dataset
 from .Cheo_FaMo import CheoFaMo

@@ -101,6 +101,9 @@ class MA3D(nn.Module):
         # ir_checkpoint = ir_checkpoint["model"]
         self.ir_back = load_pretrained_weights(self.ir_back, ir_checkpoint)
 
+        for param in self.ir_back.parameters():
+            param.requires_grad = False
+            
         self.ir_layer = nn.Linear(1024,512)
 
         #############################################################3

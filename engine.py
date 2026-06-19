@@ -18,13 +18,13 @@ def prepare_batch(batch, device):
     labels = batch["label"].to(device, non_blocking=True)
 
     npy = batch["npy"]
-    exp = npy["exp"].to(device, non_blocking=True)
-    detail = npy["detail"].to(device, non_blocking=True)
-    pose = npy["pose"].to(device, non_blocking=True)
-    shape = npy["shape"].to(device, non_blocking=True)
-    tex = npy["tex"].to(device, non_blocking=True)
+    exp     = npy["exp"].to(device, non_blocking=True)
+    jaw     = npy["jaw"].to(device, non_blocking=True)
+    eyelid  = npy["eyelid"].to(device, non_blocking=True)
+    pose    = npy["pose"].to(device, non_blocking=True)
+    shape   = npy["shape"].to(device, non_blocking=True)
 
-    x_3d = torch.cat([exp, detail, pose, shape, tex], dim=1)
+    x_3d = torch.cat([exp, jaw, eyelid, pose, shape], dim=1)  # [B, 358]
 
     return images, labels, x_3d
 

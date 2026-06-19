@@ -14,7 +14,7 @@ def get_args():
     parser = argparse.ArgumentParser("SFER Training")
 
     # Dataset
-    parser.add_argument("--data_type", default="RAF-DB", choices=["RAF-DB", "VKIST", "Cheo", "FerPlus", "Caers", "CheoFaMo"])
+    parser.add_argument("--data_type", default="RAF-DB", choices=["RAF-DB", "VKIST", "Cheo", "FerPlus", "Caers", "CheoFaMo", "4DME"])
     parser.add_argument("--num_classes", type=int, default=7)
 
     # Training

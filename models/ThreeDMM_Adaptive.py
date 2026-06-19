@@ -8,7 +8,7 @@ class ThreeDMMEncoder(nn.Module):
         super().__init__()
 
         self.net = nn.Sequential(
-            nn.Linear(334, 512),
+            nn.Linear(358, 512),
             nn.ReLU(True),
             nn.Dropout(dropout),
 

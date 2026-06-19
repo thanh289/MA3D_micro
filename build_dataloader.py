@@ -48,6 +48,11 @@ def get_dataloaders(args):
         CheoFamo_root = os.path.join(data_dir, "CheoFamo")
         train_dataset = CheoFaMo(CheoFamo_root, split="train", transform=train_transform)
         val_dataset = CheoFaMo(CheoFamo_root, split="test", transform=val_transform)
+    elif args.data_type == "4DME":
+        dme_root   = os.path.join(data_dir, "4dme_ma3d")
+        stats_path = os.path.join(dme_root, "4dme_stats.npz")
+        train_dataset = FourDME_Dataset(dme_root, is_train=True,  transform=train_transform, stats_path=stats_path)
+        val_dataset   = FourDME_Dataset(dme_root, is_train=False, transform=val_transform,   stats_path=stats_path)
     else:
         cheo_root = os.path.join(data_dir, "cheo_dataset")
         train_dataset = DatasetCheo(json_path=os.path.join(cheo_root, "votes_train.json"), root_dir=cheo_root, transform=train_transform)
