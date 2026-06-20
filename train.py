@@ -12,7 +12,7 @@ import shutil
 import argparse
 
 import wandb
-
+from collections import Counter
 
 
 
@@ -71,6 +71,25 @@ def save_checkpoint(state, resume_path, backup_dir, is_periodic=False, epoch=Non
     shutil.copy(resume_path, os.path.join(backup_dir, backup_name))
 
 
+
+def compute_class_weights(data_loader, num_classes, device):
+    all_labels = []
+    for batch in data_loader:
+        all_labels.extend(batch["label"].tolist())
+    
+    counts = Counter(all_labels)
+    total = len(all_labels)
+    
+    # weight = total / (num_classes * count) -> higher weight for less frequent classes
+    weights = torch.tensor([
+        total / (num_classes * counts.get(i, 1))
+        for i in range(num_classes)
+    ], dtype=torch.float32).to(device)
+    
+    print("Class weights:", weights)
+    return weights
+
+
 def main():
     args = get_args()
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -120,7 +139,8 @@ def main():
     if use_wandb and args.wandb_watch_model:
         wandb.watch(model, log="all", log_freq=100)
 
-    CE_criterion = torch.nn.CrossEntropyLoss()
+    class_weights = compute_class_weights(train_loader, args.num_classes, device)
+    CE_criterion  = torch.nn.CrossEntropyLoss(weight=class_weights)
     lsce_criterion = LabelSmoothingCrossEntropy(smoothing=0.2)
     MA_criterion = MarginAwareCELoss().to(device)
 
