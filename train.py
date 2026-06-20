@@ -29,6 +29,8 @@ def get_args():
     parser.add_argument("--lr", type=float, default=1e-5)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--num_workers", type=int, default=8)
+    parser.add_argument("--model_type", type=str, default="large", 
+                    choices=["small", "base", "large"])
 
     # Logging
     parser.add_argument("--log_file", type=str, default="log.txt")
@@ -117,7 +119,7 @@ def main():
 
     train_loader, val_loader = get_dataloaders(args)
 
-    model = MA3D(num_classes= args.num_classes).to(device)
+    model = MA3D(num_classes=args.num_classes, type=args.model_type).to(device)
 
     if use_wandb and args.wandb_watch_model:
         wandb.watch(model, log="all", log_freq=100)
