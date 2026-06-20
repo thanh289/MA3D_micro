@@ -60,9 +60,15 @@ def get_args():
 def save_checkpoint(state, resume_path, backup_dir, is_periodic=False, epoch=None):
     torch.save(state, resume_path)
 
-    backup_name = "4dme_best.pth" if not is_periodic else f"4dme_epoch{epoch}.pth"
-    backup_path = os.path.join(backup_dir, backup_name)
-    shutil.copy(resume_path, backup_path)
+    if is_periodic:
+        for f in os.listdir(backup_dir):
+            if f.startswith("4dme_epoch") and f.endswith(".pth"):
+                os.remove(os.path.join(backup_dir, f))
+        backup_name = f"4dme_epoch{epoch}.pth"
+    else:
+        backup_name = "4dme_best.pth"
+
+    shutil.copy(resume_path, os.path.join(backup_dir, backup_name))
 
 
 def main():
