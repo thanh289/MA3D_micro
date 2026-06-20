@@ -11,10 +11,12 @@ def get_dataloaders(args):
 
     train_transform = transforms.Compose([
         transforms.Resize((224, 224)),
-        transforms.ColorJitter(0.2, 0.2, 0.2),
+        transforms.RandomHorizontalFlip(p=0.5),
+        transforms.RandomRotation(degrees=10),
+        transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.1),
         transforms.ToTensor(),
         normalize,
-        transforms.RandomErasing(p=1, scale=(0.05, 0.05))
+        transforms.RandomErasing(p=0.5, scale=(0.02, 0.1)),
     ])
 
     val_transform = transforms.Compose([
