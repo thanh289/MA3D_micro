@@ -5,3 +5,4 @@ log/
 results/
 __pycache__/
 4dme_venv/
+wandb.txt
