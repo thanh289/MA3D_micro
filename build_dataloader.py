@@ -2,6 +2,14 @@ import os
 from torch.utils.data import DataLoader
 from torchvision import transforms
 from Read_dataset import *
+from torch.utils.data import WeightedRandomSampler
+from collections import Counter
+
+def get_sampler(dataset):
+    labels = [int(dataset[i]["label"]) for i in range(len(dataset))]
+    class_counts = Counter(labels)
+    weights = [1.0 / class_counts[l] for l in labels]
+    return WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
 
 def get_dataloaders(args):
     normalize = transforms.Normalize(
@@ -58,7 +66,8 @@ def get_dataloaders(args):
         train_dataset = DatasetCheo(json_path=os.path.join(cheo_root, "votes_train.json"), root_dir=cheo_root, transform=train_transform)
         val_dataset = DatasetCheo(json_path=os.path.join(cheo_root, "votes_valid.json"), root_dir=cheo_root, transform=val_transform)
 
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True, drop_last=True)
+    sampler = get_sampler(train_dataset)
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, sampler=sampler, num_workers=args.num_workers, pin_memory=True, drop_last=True)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True)
 
     return train_loader, val_loader
