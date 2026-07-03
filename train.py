@@ -13,6 +13,12 @@ import argparse
 
 import wandb
 from collections import Counter
+import numpy as np
+from sklearn.metrics import (
+    f1_score, recall_score, precision_score,
+    confusion_matrix, classification_report,
+)
+import matplotlib.pyplot as plt
 
 
 
@@ -22,6 +28,9 @@ def get_args():
     # Dataset
     parser.add_argument("--data_type", default="RAF-DB", choices=["RAF-DB", "VKIST", "Cheo", "FerPlus", "Caers", "CheoFaMo", "4DME"])
     parser.add_argument("--num_classes", type=int, default=7)
+    parser.add_argument("--class_names", type=str, default=None,
+                        help="Comma-separated class names theo đúng thứ tự label index, "
+                             "vd: 'Negative,Surprise,Positive,Others'. Mặc định dùng '0','1',...")
 
     # Training
     parser.add_argument("--epochs", type=int, default=100)
@@ -57,6 +66,41 @@ def get_args():
     parser.add_argument("--wandb_watch_model", action="store_true")
 
     return parser.parse_args()
+
+
+def compute_extra_metrics(y_true, y_pred, num_classes):
+    """UF1 = macro-F1, UAR = macro-recall, weighted-F1, classification_report"""
+    labels = list(range(num_classes))
+    uf1 = f1_score(y_true, y_pred, labels=labels, average="macro", zero_division=0)
+    uar = recall_score(y_true, y_pred, labels=labels, average="macro", zero_division=0)
+    weighted_f1 = f1_score(y_true, y_pred, labels=labels, average="weighted", zero_division=0)
+    report = classification_report(
+        y_true, y_pred, labels=labels, output_dict=True, zero_division=0
+    )
+    return uf1, uar, weighted_f1, report
+
+
+def plot_confusion_matrix(y_true, y_pred, num_classes, class_names=None):
+    labels = list(range(num_classes))
+    names = class_names if class_names else [str(i) for i in labels]
+    cm = confusion_matrix(y_true, y_pred, labels=labels)
+
+    fig, ax = plt.subplots(figsize=(5, 4.5))
+    im = ax.imshow(cm, cmap="Blues")
+    ax.set_xticks(labels)
+    ax.set_yticks(labels)
+    ax.set_xticklabels(names, rotation=45, ha="right")
+    ax.set_yticklabels(names)
+    ax.set_xlabel("Predicted")
+    ax.set_ylabel("Ground truth")
+    thresh = cm.max() / 2.0 if cm.max() > 0 else 0.5
+    for i in range(cm.shape[0]):
+        for j in range(cm.shape[1]):
+            ax.text(j, i, str(cm[i, j]), ha="center", va="center",
+                    color="white" if cm[i, j] > thresh else "black")
+    fig.colorbar(im, ax=ax)
+    fig.tight_layout()
+    return fig
 
 
 def save_checkpoint(state, resume_path, backup_dir, is_periodic=False, epoch=None):
@@ -117,6 +161,12 @@ def main():
         log_f.flush()
 
 
+    class_names = args.class_names.split(",") if args.class_names else None
+    if class_names and len(class_names) != args.num_classes:
+        print(f"[WARN] --class_names has {len(class_names)} names but num_classes={args.num_classes}, "
+              f"-> SKIP")
+        class_names = None
+
     train_loader, val_loader = get_dataloaders(args)
 
     model = MA3D(num_classes=args.num_classes, type=args.model_type).to(device)
@@ -136,6 +186,7 @@ def main():
 
     start_epoch = 0
     best_val_acc = 0.0
+    best_val_uf1 = 0.0
 
     if args.resume and os.path.exists(resume_path):
         print(f"Loading checkpoint from {resume_path}")
@@ -145,7 +196,8 @@ def main():
         scheduler.load_state_dict(checkpoint["scheduler"])
         start_epoch = checkpoint["epoch"] + 1
         best_val_acc = checkpoint.get("best_val_acc", 0.0)
-        print(f"Resumed from epoch {start_epoch}, best_val_acc={best_val_acc:.4f}")
+        best_val_uf1 = checkpoint.get("best_val_uf1", 0.0)
+        print(f"Resumed from epoch {start_epoch}, best_val_acc={best_val_acc:.4f}, best_val_uf1={best_val_uf1:.4f}")
         if wandb_run_id:
             print(f"wandb run_id: {wandb_run_id}")
 
@@ -157,8 +209,12 @@ def main():
             MA_criterion, optimizer, device, epoch, args.epochs
         )
 
-        val_loss, val_acc = validate(
+        val_loss, val_acc, val_labels, val_preds = validate(
             model, val_loader, CE_criterion, device, epoch, args.epochs
+        )
+
+        val_uf1, val_uar, val_weighted_f1, val_report = compute_extra_metrics(
+            val_labels, val_preds, args.num_classes
         )
 
         scheduler.step()
@@ -166,28 +222,46 @@ def main():
 
         epoch_time = (time.time() - epoch_start_time) / 60.0
 
-        is_best = val_acc > best_val_acc
+        # Use UF1 (macro-F1) for the "best" metric, acc is not good for unbalanced datasets, 
+        # especially when the majority class dominates. Still track best_val_acc in parallel.
+        is_best = val_uf1 > best_val_uf1
 
         state = {
             "epoch":        epoch,
             "model":        model.state_dict(),
             "optimizer":    optimizer.state_dict(),
             "scheduler":    scheduler.state_dict(),
-            "best_val_acc": best_val_acc if not is_best else val_acc,
+            "best_val_acc": max(best_val_acc, val_acc),
+            "best_val_uf1": best_val_uf1 if not is_best else val_uf1,
         }
 
-        #  save best ckpt
+        best_val_acc = max(best_val_acc, val_acc)
+
+        #  save best ckpt (UF1 / macro-F1)
         if is_best:
-            best_val_acc = val_acc
+            best_val_uf1 = val_uf1
             save_checkpoint(state, resume_path, args.backup_dir, is_periodic=False)
-            print(f"[Best] epoch={epoch+1}  val_acc={val_acc*100:.2f}%")
+            print(f"[Best] epoch={epoch+1}  val_acc={val_acc*100:.2f}%  "
+                  f"UF1={val_uf1:.4f}  UAR={val_uar:.4f}")
 
             if use_wandb:
-                wandb.run.summary["best_val_acc"] = best_val_acc
-                wandb.run.summary["best_epoch"]   = epoch + 1
+                wandb.run.summary["best_val_acc"]  = best_val_acc
+                wandb.run.summary["best_val_uf1"]  = best_val_uf1
+                wandb.run.summary["best_val_uar"]  = val_uar
+                wandb.run.summary["best_epoch"]    = epoch + 1
+
+                cm_fig = plot_confusion_matrix(val_labels, val_preds, args.num_classes, class_names)
+                wandb.log({"val/confusion_matrix_best": wandb.Image(cm_fig), "epoch": epoch + 1})
+                plt.close(cm_fig)
 
             if log_f:
-                log_f.write(f"BEST\tval_acc={val_acc*100:.2f}\n")
+                log_f.write(f"BEST\tval_acc={val_acc*100:.2f}\tUF1={val_uf1:.4f}\tUAR={val_uar:.4f}\n")
+                per_class = {
+                    (class_names[int(k)] if class_names and k.isdigit() else k): v
+                    for k, v in val_report.items()
+                    if k not in ("accuracy", "macro avg", "weighted avg")
+                }
+                log_f.write(f"\tPer-class: {per_class}\n")
                 log_f.flush()
 
         #  backup each N epoch 
@@ -205,20 +279,25 @@ def main():
                 "train/acc": train_acc,
                 "val/loss": val_loss,
                 "val/acc": val_acc,
+                "val/uf1": val_uf1,
+                "val/uar": val_uar,
+                "val/weighted_f1": val_weighted_f1,
                 "epoch_time_min": epoch_time,
                 "best_val_acc": best_val_acc,
+                "best_val_uf1": best_val_uf1,
             })
 
         if log_f:
             log_f.write(
                 f"{epoch + 1:^6d} {lr:^12.8f} {train_loss:^12.4f} {train_acc * 100:^10.2f} "
-                f"{val_loss:^12.4f} {val_acc * 100:^10.2f} {epoch_time:^10.2f}\n"
+                f"{val_loss:^12.4f} {val_acc * 100:^10.2f} "
+                f"UF1={val_uf1:.4f} UAR={val_uar:.4f} {epoch_time:^10.2f}\n"
             )
             log_f.flush()
 
-    print(f"\nBest validation accuracy: {best_val_acc * 100:.2f}%")
+    print(f"\nBest validation accuracy: {best_val_acc * 100:.2f}%  |  Best UF1 (macro-F1): {best_val_uf1:.4f}")
     if log_f:
-        log_f.write(f"\nBest validation accuracy: {best_val_acc * 100:.2f}%")
+        log_f.write(f"\nBest validation accuracy: {best_val_acc * 100:.2f}%  |  Best UF1: {best_val_uf1:.4f}")
         log_f.close()
 
     if use_wandb:

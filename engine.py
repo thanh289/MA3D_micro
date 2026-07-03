@@ -68,6 +68,7 @@ def train_one_epoch(model, loader, CE_criterion, lsce_criterion, MA_criterion,
 def validate(model, loader, criterion, device, epoch, epochs):
     model.eval()
     running_loss, correct, total = 0.0, 0, 0
+    all_labels, all_preds = [], []
 
     for batch in tqdm(loader, desc=f"Validation [{epoch + 1}/{epochs}]", leave=False):
         images, labels, x_3d = prepare_batch(batch, device)
@@ -76,9 +77,17 @@ def validate(model, loader, criterion, device, epoch, epochs):
         loss = criterion(logits, labels)
 
         running_loss += loss.item() * labels.size(0)
-        correct += (logits.argmax(dim=1) == labels).sum().item()
+        preds = logits.argmax(dim=1)
+        correct += (preds == labels).sum().item()
         total += labels.size(0)
+
+        all_labels.append(labels.detach().cpu())
+        all_preds.append(preds.detach().cpu())
 
     epoch_loss = running_loss / total
     epoch_acc = correct / total
-    return epoch_loss, epoch_acc
+
+    all_labels = torch.cat(all_labels).numpy()
+    all_preds = torch.cat(all_preds).numpy()
+
+    return epoch_loss, epoch_acc, all_labels, all_preds
