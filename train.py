@@ -255,7 +255,7 @@ def main():
                 plt.close(cm_fig)
 
             if log_f:
-                log_f.write(f"BEST\tval_acc={val_acc*100:.2f}\tUF1={val_uf1:.4f}\tUAR={val_uar:.4f}\n")
+                log_f.write(f"BEST\tval_acc={val_acc*100:.2f}\tUF1={val_uf1:.4f}\tUAR={val_uar:.4f}\tF1={val_weighted_f1:.4f}\n")
                 per_class = {
                     (class_names[int(k)] if class_names and k.isdigit() else k): v
                     for k, v in val_report.items()
