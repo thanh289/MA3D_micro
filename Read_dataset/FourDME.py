@@ -63,7 +63,8 @@ class FourDME_Dataset(Dataset):
 
             # check full set of npy files
             npy_files = [f for f in os.listdir(path) if f.endswith(".npy")]
-            if len(npy_files) < len(self.keys):
+            missing = any(not os.path.exists(os.path.join(path, f"{k}.npy")) for k in self.keys)
+            if missing:
                 skipped += 1
                 continue
 

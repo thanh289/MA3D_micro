@@ -5,51 +5,94 @@ import torch.nn.functional as F
 class ThreeDMMEncoderCNN(nn.Module):
     """
     CNN encoder cho prior dạng spatial map (thay MLP khi input là flow map
-    chưa pool, kiểu STSTNet: [B, C, H, W] thay vì vector phẳng).
+    chưa pool, kiểu STSTNet/MEAN: [B, C, H, W] thay vì vector phẳng).
+
+    Khác bản trước ở 2 điểm (theo tinh thần MEAN_Spot trong define_model.py gốc):
+      1) Mỗi kênh (u, v, os) đi qua 1 nhánh Conv2d RIÊNG (không dùng chung 1
+         Conv2d(in_channels,...) như xử lý ảnh RGB) -- vì u, v, os là 3 đại
+         lượng vật lý khác nhau (không tương quan như RGB), tách nhánh cho
+         phép mỗi kênh học bộ filter/độ sâu riêng (MEAN dùng 3, 3, 8 filter
+         cho u, v, os) rồi mới concat lại ở lớp interpretation.
+      2) 2 ROI (eyebrow, mouth) được encode riêng rồi CONCAT (không mean-pool
+         nữa) -- tránh san bằng đóng góp của 2 vùng có tín hiệu AU rất khác
+         nhau (vd ngạc nhiên chủ yếu ở lông mày, khinh bỉ chủ yếu ở miệng).
 
     input: x_3d shape [B, n_roi, C, H, W] (vd [B, 2, 3, 28, 28] cho
-        2 ROI x (u, v, os) x 28x28) HOẶC [B, C, H, W] nếu đã gộp n_roi vào C
-        từ bước tiền xử lý. Hai ROI được gộp vào batch-dim rồi conv chung
-        (weight-sharing giữa các ROI) thay vì mỗi ROI một nhánh riêng --
-        đơn giản hơn và ít tham số hơn, hợp lý khi n_roi nhỏ (2) và data ít.
-
+        2 ROI x (u, v, os) x 28x28) HOẶC [B, C, H, W] nếu chỉ có 1 ROI.
     Output: [B, embed_dim] -- cùng shape với ThreeDMMEncoder (MLP) nên có
     thể cắm thẳng vào ThreeDMMConditionGenerator không cần sửa gì thêm.
     """
 
-    def __init__(self, in_channels=3, embed_dim=256, dropout=0.2):
+    def __init__(self, in_channels=3, embed_dim=256, dropout=0.2,
+                 roi_embed_dim=64, branch_channels=(3, 3, 8), n_roi=2):
+        """
+        n_roi: số ROI CỐ ĐỊNH sẽ nhận vào forward (vd 2: eyebrow + mouth).
+            Khai báo tường minh ở __init__ (không lazy-infer lúc forward),
+            vì optimizer (SAM trong train.py) được khởi tạo bằng
+            model.parameters() NGAY SAU khi tạo model, TRƯỚC lần forward
+            đầu tiên -- một layer tạo lười trong forward() sẽ bị bỏ sót
+            khỏi optimizer.param_groups và không bao giờ được cập nhật
+            gradient (silent bug, không raise exception, chỉ âm thầm học
+            kém đi mà không ai biết).
+        """
         super().__init__()
+        assert in_channels == 3, (
+            "Thiết kế 3-nhánh (u, v, os) yêu cầu in_channels=3; "
+            "nếu bạn có số kênh khác, sửa branch_channels cho khớp."
+        )
+        c_u, c_v, c_os = branch_channels
+        self.n_roi = n_roi
 
-        # rất nông có chủ đích (giống tinh thần STSTNet ~0.00167M param) --
-        # dataset nhỏ, không cần/không nên đi sâu.
-        self.conv = nn.Sequential(
-            nn.Conv2d(in_channels, 16, kernel_size=3, padding=1),
-            nn.BatchNorm2d(16),
-            nn.ReLU(True),
-            nn.MaxPool2d(2),                       # 28x28 -> 14x14
+        def make_branch(out_ch):
+            # kernel 5x5 + BN + pool, phỏng theo define_model.py::MEAN_Spot gốc
+            return nn.Sequential(
+                nn.Conv2d(1, out_ch, kernel_size=5, padding=2),
+                nn.BatchNorm2d(out_ch),
+                nn.ReLU(True),
+                nn.MaxPool2d(kernel_size=3, stride=3, ceil_mode=True),
+                nn.Dropout2d(0.3),
+            )
 
-            nn.Conv2d(16, 32, kernel_size=3, padding=1),
-            nn.BatchNorm2d(32),
+        self.branch_u  = make_branch(c_u)
+        self.branch_v  = make_branch(c_v)
+        self.branch_os = make_branch(c_os)
+
+        merged_ch = c_u + c_v + c_os
+        self.merge = nn.Sequential(
+            nn.Conv2d(merged_ch, 8, kernel_size=5, padding=2),
             nn.ReLU(True),
-            nn.AdaptiveAvgPool2d(1),               # global pool -> [B*n_roi, 32, 1, 1]
+            nn.MaxPool2d(kernel_size=2, stride=2, ceil_mode=True),
+            # AdaptiveAvgPool thay vì tính tay kích thước còn lại sau 2 lần
+            # pool -- tránh lỗi shape khi FLOW_MAP_SIZE thay đổi, vì Keras
+            # padding='same' và PyTorch không chia hết giống hệt nhau.
+            nn.AdaptiveAvgPool2d(4),
         )
         self.dropout = nn.Dropout(dropout)
-        self.proj = nn.Linear(32, embed_dim)
+        self.roi_proj = nn.Linear(8 * 4 * 4, roi_embed_dim)
+        # final_proj khai báo NGAY ở đây (không lazy) vì n_roi đã biết trước
+        self.final_proj = nn.Linear(n_roi * roi_embed_dim, embed_dim)
+
+    def _encode_one_roi(self, x):  # x: [B, 3, H, W]
+        u, v, os_ = x[:, 0:1], x[:, 1:2], x[:, 2:3]
+        f = torch.cat([self.branch_u(u), self.branch_v(v), self.branch_os(os_)], dim=1)
+        f = self.merge(f)
+        f = self.dropout(f.flatten(1))
+        return self.roi_proj(f)  # [B, roi_embed_dim]
 
     def forward(self, x_3d):
         if x_3d.dim() == 5:
-            # [B, n_roi, C, H, W] -> gộp n_roi vào batch để weight-share
-            # giữa các ROI, rồi mean-pool embedding của các ROI lại theo B
             B, R, C, H, W = x_3d.shape
-            x = x_3d.view(B * R, C, H, W)
-            feat = self.conv(x).flatten(1)         # [B*R, 32]
-            feat = feat.view(B, R, -1).mean(dim=1)  # [B, 32] -- gộp ROI
+            assert R == self.n_roi, (
+                f"n_roi lúc __init__ ({self.n_roi}) không khớp dữ liệu thực "
+                f"tế (R={R}). Sửa tham số n_roi khi khởi tạo MA3D/ThreeDMMFusion."
+            )
+            roi_embeds = [self._encode_one_roi(x_3d[:, r]) for r in range(R)]
+            feat = torch.cat(roi_embeds, dim=1)   # [B, R * roi_embed_dim] -- concat, không mean
         else:
-            # [B, C, H, W] -- đã gộp ROI vào C từ tiền xử lý
-            feat = self.conv(x_3d).flatten(1)      # [B, 32]
+            assert self.n_roi == 1, "input 4D (1 ROI) nhưng n_roi khởi tạo != 1"
+            feat = self._encode_one_roi(x_3d)      # [B, roi_embed_dim]
 
-        feat = self.dropout(feat)
-        return self.proj(feat)
+        return self.final_proj(feat)
 
 
 class ThreeDMMEncoder(nn.Module):
@@ -180,7 +223,7 @@ class ThreeDMMFusion(nn.Module):
 
     def __init__(self, feat_nc=512, embed_dim=256, num_blocks=5,
                  x3d_dim=358, x3d_hidden_dim=None,
-                 x3d_mode="mlp", x3d_channels=3):
+                 x3d_mode="mlp", x3d_channels=3, x3d_n_roi=2):
         """
         x3d_dim: chiều vector prior 3D đầu vào -- CHỈ dùng khi x3d_mode="mlp"
             (358 cho SMIRK cũ, 16 cho flow-pooled-vector).
@@ -191,6 +234,10 @@ class ThreeDMMFusion(nn.Module):
             hoặc "cnn" (flow map thô chưa pool, kiểu STSTNet -- xem ThreeDMMEncoderCNN).
         x3d_channels: số kênh input cho CNN encoder -- CHỈ dùng khi x3d_mode="cnn".
             Vd 3 nếu x_3d shape [B, n_roi, 3, H, W] (u, v, os mỗi ROI).
+        x3d_n_roi: số ROI CỐ ĐỊNH của flow map -- CHỈ dùng khi x3d_mode="cnn".
+            Mặc định 2 (eyebrow + mouth, xem run_inference_flow.py). Phải
+            khớp đúng n_roi thực tế trong flow_map.npy, nếu không sẽ assert
+            fail ngay ở forward (xem ThreeDMMEncoderCNN.forward).
         """
 
         super().__init__()
@@ -202,6 +249,7 @@ class ThreeDMMFusion(nn.Module):
             self.encoder_3dmm = ThreeDMMEncoderCNN(
                 in_channels=x3d_channels,
                 embed_dim=embed_dim,
+                n_roi=x3d_n_roi,
             )
         else:
             # NOTE: trước đây gọi ThreeDMMEncoder(embed_dim) theo vị trí (positional).

@@ -71,7 +71,7 @@ class ClassificationHead(nn.Module):
 class MA3D(nn.Module):
     def __init__(self, img_size=224, num_classes=7, type="large",
                  x3d_dim=358, x3d_hidden_dim=None,
-                 x3d_mode="mlp", x3d_channels=3):
+                 x3d_mode="mlp", x3d_channels=3, x3d_n_roi=2):
         """
         x3d_dim, x3d_hidden_dim: xem ThreeDMMFusion -- chỉ dùng khi x3d_mode="mlp".
         x3d_mode: "mlp" (vector đã pool: SMIRK 358-dim hoặc flow-pooled 16-dim)
@@ -129,6 +129,7 @@ class MA3D(nn.Module):
             x3d_hidden_dim=x3d_hidden_dim,
             x3d_mode=x3d_mode,
             x3d_channels=x3d_channels,
+            x3d_n_roi=x3d_n_roi, 
         )
 
 
