@@ -1,15 +1,23 @@
 import os
+import torch
 from torch.utils.data import DataLoader
 from torchvision import transforms
 from Read_dataset import *
 from torch.utils.data import WeightedRandomSampler
 from collections import Counter
+import random
+import numpy as np
 
 def get_sampler(dataset):
     labels = [int(dataset[i]["label"]) for i in range(len(dataset))]
     class_counts = Counter(labels)
     weights = [1.0 / class_counts[l] for l in labels]
     return WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
+
+def seed_worker(worker_id):
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
 
 def get_dataloaders(args):
     normalize = transforms.Normalize(
@@ -88,7 +96,11 @@ def get_dataloaders(args):
         train_dataset = DatasetCheo(json_path=os.path.join(cheo_root, "votes_train.json"), root_dir=cheo_root, transform=train_transform)
         val_dataset = DatasetCheo(json_path=os.path.join(cheo_root, "votes_valid.json"), root_dir=cheo_root, transform=val_transform)
 
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True, drop_last=True)
+    g = torch.Generator()
+    g.manual_seed(args.seed)
+
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True, drop_last=True,
+                              worker_init_fn=seed_worker, generator=g)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True)
 
     return train_loader, val_loader

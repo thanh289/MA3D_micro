@@ -19,12 +19,22 @@ from sklearn.metrics import (
     confusion_matrix, classification_report,
 )
 import matplotlib.pyplot as plt
+import random
+import numpy as np
 
+def set_seed(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 
 def get_args():
     parser = argparse.ArgumentParser("SFER Training")
 
+    parser.add_argument("--seed", type=int, default=42)
     # Dataset
     parser.add_argument("--data_type", default="RAF-DB", choices=["RAF-DB", "VKIST", "Cheo", "FerPlus", "Caers", "CheoFaMo", "4DME", "4DME_FLOW", "4DME_FLOW_CNN"])
     parser.add_argument("--num_classes", type=int, default=7)
@@ -135,6 +145,7 @@ def save_checkpoint(state, resume_path, backup_dir, is_periodic=False, epoch=Non
 
 def main():
     args = get_args()
+    set_seed(args.seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     os.makedirs(args.resume_dir, exist_ok=True)
@@ -240,7 +251,7 @@ def main():
     for epoch in range(start_epoch, args.epochs):
         epoch_start_time = time.time()
 
-        train_loss, train_acc = train_one_epoch(
+        train_loss, train_acc, train_labels, train_preds = train_one_epoch(
             model, train_loader, CE_criterion, lsce_criterion,
             MA_criterion, optimizer, device, epoch, args.epochs,
             x3d_keys=x3d_keys
@@ -253,6 +264,10 @@ def main():
 
         val_uf1, val_uar, val_weighted_f1, val_report = compute_extra_metrics(
             val_labels, val_preds, args.num_classes
+        )
+
+        train_uf1, train_uar, train_weighted_f1, train_report = compute_extra_metrics(
+            train_labels, train_preds, args.num_classes
         )
 
         scheduler.step()
@@ -315,6 +330,9 @@ def main():
                 "lr": lr,
                 "train/loss": train_loss,
                 "train/acc": train_acc,
+                "train/uf1": train_uf1,
+                "train/uar": train_uar,
+                "train/weighted_f1": train_weighted_f1,
                 "val/loss": val_loss,
                 "val/acc": val_acc,
                 "val/uf1": val_uf1,
@@ -328,6 +346,7 @@ def main():
         if log_f:
             log_f.write(
                 f"{epoch + 1:^6d} {lr:^12.8f} {train_loss:^12.4f} {train_acc * 100:^10.2f} "
+                f"trainUF1={train_uf1:.4f} trainUAR={train_uar:.4f} "
                 f"{val_loss:^12.4f} {val_acc * 100:^10.2f} "
                 f"UF1={val_uf1:.4f} UAR={val_uar:.4f} {epoch_time:^10.2f}\n"
             )

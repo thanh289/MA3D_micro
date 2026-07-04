@@ -44,6 +44,7 @@ def train_one_epoch(model, loader, CE_criterion, lsce_criterion, MA_criterion,
 
     model.train()
     running_loss, correct, total = 0.0, 0, 0
+    all_labels, all_preds = [], []   
 
     for batch_idx, batch in enumerate(
         tqdm(loader, desc=f"Training [{epoch + 1}/{epochs}]", leave=False)
@@ -57,12 +58,10 @@ def train_one_epoch(model, loader, CE_criterion, lsce_criterion, MA_criterion,
         loss.backward()
         optimizer.first_step(zero_grad=True)
 
-
         logits_2, features_2, attn = model(images, x_3d)
         loss_2 = get_loss(logits_2, labels, CE_criterion, lsce_criterion, MA_criterion, epoch)
         loss_2.backward()
         optimizer.second_step(zero_grad=True)
-
 
         batch_size = labels.size(0)
         running_loss += loss.item() * batch_size
@@ -70,10 +69,16 @@ def train_one_epoch(model, loader, CE_criterion, lsce_criterion, MA_criterion,
         correct += (preds == labels).sum().item()
         total += batch_size
 
+        all_labels.append(labels.detach().cpu())    
+        all_preds.append(preds.detach().cpu())
+
     epoch_loss = running_loss / total
     epoch_acc = correct / total
 
-    return epoch_loss, epoch_acc
+    all_labels = torch.cat(all_labels).numpy()
+    all_preds = torch.cat(all_preds).numpy()  
+
+    return epoch_loss, epoch_acc, all_labels, all_preds   
 
 
 @torch.no_grad()
