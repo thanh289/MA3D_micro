@@ -61,6 +61,28 @@ def get_dataloaders(args):
         stats_path = os.path.join(dme_root, "4dme_stats.npz")
         train_dataset = FourDME_Dataset(dme_root, is_train=True,  transform=train_transform, stats_path=stats_path)
         val_dataset   = FourDME_Dataset(dme_root, is_train=False, transform=val_transform,   stats_path=stats_path)
+    elif args.data_type == "4DME_FLOW":
+        # Prior mới thay SMIRK: optical-flow ROI-pooled vector (16-dim), xem run_inference_flow.py
+        dme_flow_root = os.path.join(data_dir, "4dme_ma3d_flow")
+        stats_path    = os.path.join(dme_flow_root, "4dme_flow_stats.npz")
+        train_dataset = FourDME_Dataset(dme_flow_root, is_train=True,  transform=train_transform,
+                                         stats_path=stats_path, keys=["flow"])
+        val_dataset   = FourDME_Dataset(dme_flow_root, is_train=False, transform=val_transform,
+                                         stats_path=stats_path, keys=["flow"])
+    elif args.data_type == "4DME_FLOW_CNN":
+        # Prior dạng spatial map thô (chưa pool), xem run_inference_flow.py --feature_mode cnn
+        # flow_map.npy: [n_roi=2, C=3, H=28, W=28] mỗi sample -- dùng với
+        # MA3D(x3d_mode="cnn", x3d_channels=3).
+        dme_flow_cnn_root = os.path.join(data_dir, "4dme_ma3d_flow_cnn")
+        stats_path         = os.path.join(dme_flow_cnn_root, "4dme_flow_cnn_stats.npz")
+        # stats_path thường không cần thiết ở đây (BatchNorm2d trong
+        # ThreeDMMEncoderCNN đã tự chuẩn hoá theo batch) -- chỉ dùng nếu file
+        # stats tồn tại, không bắt buộc phải tính trước như mode "mlp".
+        has_stats = os.path.exists(stats_path)
+        train_dataset = FourDME_Dataset(dme_flow_cnn_root, is_train=True,  transform=train_transform,
+                                         stats_path=stats_path if has_stats else None, keys=["flow_map"])
+        val_dataset   = FourDME_Dataset(dme_flow_cnn_root, is_train=False, transform=val_transform,
+                                         stats_path=stats_path if has_stats else None, keys=["flow_map"])
     else:
         cheo_root = os.path.join(data_dir, "cheo_dataset")
         train_dataset = DatasetCheo(json_path=os.path.join(cheo_root, "votes_train.json"), root_dir=cheo_root, transform=train_transform)

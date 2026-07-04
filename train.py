@@ -26,7 +26,7 @@ def get_args():
     parser = argparse.ArgumentParser("SFER Training")
 
     # Dataset
-    parser.add_argument("--data_type", default="RAF-DB", choices=["RAF-DB", "VKIST", "Cheo", "FerPlus", "Caers", "CheoFaMo", "4DME"])
+    parser.add_argument("--data_type", default="RAF-DB", choices=["RAF-DB", "VKIST", "Cheo", "FerPlus", "Caers", "CheoFaMo", "4DME", "4DME_FLOW", "4DME_FLOW_CNN"])
     parser.add_argument("--num_classes", type=int, default=7)
     parser.add_argument("--class_names", type=str, default=None,
                         help="Comma-separated class names theo đúng thứ tự label index, "
@@ -40,6 +40,20 @@ def get_args():
     parser.add_argument("--num_workers", type=int, default=8)
     parser.add_argument("--model_type", type=str, default="large", 
                     choices=["small", "base", "large"])
+    parser.add_argument("--x3d_dim", type=int, default=None,
+                        help="Chiều vector prior 3D. None -> tự suy ra theo data_type "
+                             "(358 cho '4DME'/SMIRK, 16 cho '4DME_FLOW').")
+    parser.add_argument("--x3d_hidden_dim", type=int, default=None,
+                        help="Hidden dim của ThreeDMMEncoder. None -> 512 (SMIRK) hoặc "
+                             "64 (flow) tuỳ theo x3d_dim được suy ra. Chỉ áp dụng khi "
+                             "x3d_mode='mlp'.")
+    parser.add_argument("--x3d_mode", type=str, default="mlp", choices=["mlp", "cnn"],
+                        help="'mlp': prior là vector đã pool (SMIRK 358-dim hoặc "
+                             "flow-pooled-vector 16-dim). 'cnn': prior là flow map thô "
+                             "chưa pool [n_roi, C, H, W], dùng ThreeDMMEncoderCNN.")
+    parser.add_argument("--x3d_channels", type=int, default=3,
+                        help="Số kênh input cho CNN encoder (vd 3 cho u,v,optical-strain). "
+                             "Chỉ áp dụng khi x3d_mode='cnn'.")
 
     # Logging
     parser.add_argument("--log_file", type=str, default="log.txt")
@@ -169,7 +183,29 @@ def main():
 
     train_loader, val_loader = get_dataloaders(args)
 
-    model = MA3D(num_classes=args.num_classes, type=args.model_type).to(device)
+    # Prior 3D: SMIRK (358-dim, 5 keys, mlp) mặc định; flow-pooled-vector
+    # (16-dim, 1 key, mlp) khi --data_type 4DME_FLOW; hoặc flow spatial map
+    # (1 key, cnn) khi --data_type 4DME_FLOW_CNN. Override thủ công qua
+    # --x3d_dim/--x3d_hidden_dim/--x3d_mode/--x3d_channels nếu cần.
+    if args.data_type == "4DME_FLOW_CNN":
+        x3d_keys = ["flow_map"]
+        x3d_dim = args.x3d_dim  # không dùng ở mode cnn, giữ None cho rõ ràng
+        x3d_hidden_dim = args.x3d_hidden_dim  # không dùng ở mode cnn
+        # chỉ override x3d_mode nếu người dùng chưa tự set khác "mlp" mặc định
+        if args.x3d_mode == "mlp":
+            args.x3d_mode = "cnn"
+    elif args.data_type == "4DME_FLOW":
+        x3d_keys = ["flow"]
+        x3d_dim = args.x3d_dim if args.x3d_dim is not None else 16
+        x3d_hidden_dim = args.x3d_hidden_dim if args.x3d_hidden_dim is not None else 64
+    else:
+        x3d_keys = ["exp", "jaw", "eyelid", "pose", "shape"]
+        x3d_dim = args.x3d_dim if args.x3d_dim is not None else 358
+        x3d_hidden_dim = args.x3d_hidden_dim  # None -> mặc định 512 trong ThreeDMMEncoder
+
+    model = MA3D(num_classes=args.num_classes, type=args.model_type,
+                  x3d_dim=x3d_dim, x3d_hidden_dim=x3d_hidden_dim,
+                  x3d_mode=args.x3d_mode, x3d_channels=args.x3d_channels).to(device)
 
     if use_wandb and args.wandb_watch_model:
         wandb.watch(model, log="all", log_freq=100)
@@ -206,11 +242,13 @@ def main():
 
         train_loss, train_acc = train_one_epoch(
             model, train_loader, CE_criterion, lsce_criterion,
-            MA_criterion, optimizer, device, epoch, args.epochs
+            MA_criterion, optimizer, device, epoch, args.epochs,
+            x3d_keys=x3d_keys
         )
 
         val_loss, val_acc, val_labels, val_preds = validate(
-            model, val_loader, CE_criterion, device, epoch, args.epochs
+            model, val_loader, CE_criterion, device, epoch, args.epochs,
+            x3d_keys=x3d_keys
         )
 
         val_uf1, val_uar, val_weighted_f1, val_report = compute_extra_metrics(

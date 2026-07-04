@@ -16,7 +16,14 @@ IDX2EMOTION = {v: k for k, v in EMOTION2IDX.items()}
 
 class FourDME_Dataset(Dataset):
     def __init__(self, root_dir, is_train=True, transform=None,
-                 stats_path=None, verbose=False):
+                 stats_path=None, verbose=False, keys=None):
+        """
+        keys: danh sách tên file .npy (không kể ".npy") tạo thành prior 3D.
+            - None / mặc định : ["exp","jaw","eyelid","pose","shape"] (SMIRK, 358-dim tổng)
+            - ["flow"]        : prior mới từ optical flow (16-dim), xem run_inference_flow.py
+        Thứ tự trong `keys` chính là thứ tự ghép nối trong engine.py::prepare_batch,
+        cần giữ cố định để tương thích ngược với checkpoint đã train trước đó.
+        """
 
         self.transform = transform
         split = "train" if is_train else "test"
@@ -31,8 +38,8 @@ class FourDME_Dataset(Dataset):
             stats = np.load(stats_path)
             self.stats = {k: torch.from_numpy(v).float() for k, v in stats.items()}
 
-        # FLAME keys from SMIRK
-        self.keys = ["exp", "jaw", "eyelid", "pose", "shape"]
+        # keys của prior 3D: SMIRK (5 keys) mặc định, hoặc flow (1 key) nếu truyền vào
+        self.keys = keys if keys is not None else ["exp", "jaw", "eyelid", "pose", "shape"]
 
         # scan dataset 
         self.samples = []
@@ -105,9 +112,13 @@ class FourDME_Dataset(Dataset):
         }
 
 
-def compute_4dme_stats(root_dir, split="train", output="4dme_stats.npz"):
+def compute_4dme_stats(root_dir, split="train", output="4dme_stats.npz", keys=None):
+    """
+    keys: mặc định 5 keys SMIRK; truyền keys=["flow"] để tính stats cho prior mới
+    (flow.npy, 16-dim) sinh ra bởi run_inference_flow.py.
+    """
     split_dir = os.path.join(root_dir, split)
-    keys = ["exp", "jaw", "eyelid", "pose", "shape"]
+    keys = keys if keys is not None else ["exp", "jaw", "eyelid", "pose", "shape"]
     buffers = defaultdict(list)
     used = skipped = 0
 
@@ -146,8 +157,18 @@ def compute_4dme_stats(root_dir, split="train", output="4dme_stats.npz"):
 
 if __name__ == "__main__":
 
+    # SMIRK prior cũ (358-dim) — giữ để tương thích ngược
+    # compute_4dme_stats(
+    #     root_dir="D:/Learning/Lab/MICRO EXPRESSION/MA3D-Net/datasets/4dme_ma3d",
+    #     split="train",
+    #     output="4dme_stats.npz",
+    #     keys=["exp", "jaw", "eyelid", "pose", "shape"],
+    # )
+
+    # Flow prior mới (16-dim), dữ liệu sinh bởi run_inference_flow.py
     compute_4dme_stats(
-        root_dir="D:/Learning/Lab/MICRO EXPRESSION/MA3D-Net/datasets/4dme_ma3d", 
-        split="train", 
-        output="4dme_stats.npz"
+        root_dir="D:/Learning/Lab/MICRO EXPRESSION/MA3D-Net/datasets/4dme_ma3d_flow",
+        split="train",
+        output="4dme_flow_stats.npz",
+        keys=["flow"],
     )

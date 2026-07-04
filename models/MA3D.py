@@ -69,7 +69,15 @@ class ClassificationHead(nn.Module):
 
 
 class MA3D(nn.Module):
-    def __init__(self, img_size=224, num_classes=7, type="large"):
+    def __init__(self, img_size=224, num_classes=7, type="large",
+                 x3d_dim=358, x3d_hidden_dim=None,
+                 x3d_mode="mlp", x3d_channels=3):
+        """
+        x3d_dim, x3d_hidden_dim: xem ThreeDMMFusion -- chỉ dùng khi x3d_mode="mlp".
+        x3d_mode: "mlp" (vector đã pool: SMIRK 358-dim hoặc flow-pooled 16-dim)
+            hoặc "cnn" (flow map thô chưa pool, vd [B, 2, 3, 28, 28]).
+        x3d_channels: số kênh CNN input -- chỉ dùng khi x3d_mode="cnn".
+        """
         super().__init__()
         depth = 8
         if type == "small":
@@ -115,7 +123,13 @@ class MA3D(nn.Module):
 
         self.se_block = SE_block(input_dim=512)
         self.head = ClassificationHead(input_dim=512, target_dim=self.num_classes)
-        self.mm_fusion = ThreeDMMFusion(feat_nc=512)
+        self.mm_fusion = ThreeDMMFusion(
+            feat_nc=512,
+            x3d_dim=x3d_dim,
+            x3d_hidden_dim=x3d_hidden_dim,
+            x3d_mode=x3d_mode,
+            x3d_channels=x3d_channels,
+        )
 
 
     def forward(self, x, x_3d):
@@ -158,5 +172,3 @@ class MA3D(nn.Module):
     #     out = self.head(y_hat)
     #
     #     return out, y_feat
-
-
