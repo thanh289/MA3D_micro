@@ -8,11 +8,12 @@ from collections import Counter
 import random
 import numpy as np
 
-def get_sampler(dataset):
-    labels = [int(dataset[i]["label"]) for i in range(len(dataset))]
+def get_sampler(dataset, generator=None):
+    labels = [int(np.load(os.path.join(s["folder"], "label.npy"))) for s in dataset.samples]
     class_counts = Counter(labels)
     weights = [1.0 / class_counts[l] for l in labels]
-    return WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
+    return WeightedRandomSampler(weights, num_samples=len(weights),
+                                  replacement=True, generator=generator)
 
 def seed_worker(worker_id):
     worker_seed = torch.initial_seed() % 2**32
@@ -99,8 +100,20 @@ def get_dataloaders(args):
     g = torch.Generator()
     g.manual_seed(args.seed)
 
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True, drop_last=True,
-                              worker_init_fn=seed_worker, generator=g)
+    if getattr(args, "use_sampler", False):
+        train_sampler = get_sampler(train_dataset, generator=g) 
+        train_loader = DataLoader(
+            train_dataset, batch_size=args.batch_size, sampler=train_sampler,
+            num_workers=args.num_workers, pin_memory=True, drop_last=True,
+            worker_init_fn=seed_worker, generator=g,
+        )
+    else:
+        train_loader = DataLoader(
+            train_dataset, batch_size=args.batch_size, shuffle=True,
+            num_workers=args.num_workers, pin_memory=True, drop_last=True,
+            worker_init_fn=seed_worker, generator=g,
+        )
+
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True)
 
     return train_loader, val_loader

@@ -35,6 +35,7 @@ def get_args():
     parser = argparse.ArgumentParser("SFER Training")
 
     parser.add_argument("--seed", type=int, default=42)
+
     # Dataset
     parser.add_argument("--data_type", default="RAF-DB", choices=["RAF-DB", "VKIST", "Cheo", "FerPlus", "Caers", "CheoFaMo", "4DME", "4DME_FLOW", "4DME_FLOW_CNN"])
     parser.add_argument("--num_classes", type=int, default=7)
@@ -64,6 +65,7 @@ def get_args():
     parser.add_argument("--x3d_channels", type=int, default=3,
                         help="Số kênh input cho CNN encoder (vd 3 cho u,v,optical-strain). "
                              "Chỉ áp dụng khi x3d_mode='cnn'.")
+    parser.add_argument("--use_sampler", action="store_true")
 
     # Logging
     parser.add_argument("--log_file", type=str, default="log.txt")
