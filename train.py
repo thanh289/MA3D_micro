@@ -293,11 +293,15 @@ def main():
         best_val_acc = max(best_val_acc, val_acc)
 
         #  save best ckpt (UF1 / macro-F1)
+        #  save best ckpt (UF1 / macro-F1)
         if is_best:
             best_val_uf1 = val_uf1
             save_checkpoint(state, resume_path, args.backup_dir, is_periodic=False)
             print(f"[Best] epoch={epoch+1}  val_acc={val_acc*100:.2f}%  "
                   f"UF1={val_uf1:.4f}  UAR={val_uar:.4f}")
+
+            np.save(os.path.join(args.backup_dir, "best_val_labels.npy"), val_labels)
+            np.save(os.path.join(args.backup_dir, "best_val_preds.npy"), val_preds)
 
             if use_wandb:
                 wandb.run.summary["best_val_acc"]  = best_val_acc
