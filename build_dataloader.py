@@ -78,20 +78,17 @@ def get_dataloaders(args):
                                          stats_path=stats_path, keys=["flow"])
         val_dataset   = FourDME_Dataset(dme_flow_root, is_train=False, transform=val_transform,
                                          stats_path=stats_path, keys=["flow"])
-    elif args.data_type == "4DME_FLOW_CNN":
-        # Prior dạng spatial map thô (chưa pool), xem run_inference_flow.py --feature_mode cnn
-        # flow_map.npy: [n_roi=2, C=3, H=28, W=28] mỗi sample -- dùng với
-        # MA3D(x3d_mode="cnn", x3d_channels=3).
-        dme_flow_cnn_root = os.path.join(data_dir, "4dme_ma3d_flow_cnn")
-        stats_path         = os.path.join(dme_flow_cnn_root, "4dme_flow_cnn_stats.npz")
+    elif args.data_type == "4DME_FLOW_MEAN":
+        dme_mean_root = os.path.join(data_dir, "4dme_ma3d_flow_mean")
+        stats_path         = os.path.join(dme_mean_root, "4dme_flow_mean_stats.npz")
         # stats_path thường không cần thiết ở đây (BatchNorm2d trong
         # ThreeDMMEncoderCNN đã tự chuẩn hoá theo batch) -- chỉ dùng nếu file
         # stats tồn tại, không bắt buộc phải tính trước như mode "mlp".
         has_stats = os.path.exists(stats_path)
-        train_dataset = FourDME_Dataset(dme_flow_cnn_root, is_train=True,  transform=train_transform,
-                                         stats_path=stats_path if has_stats else None, keys=["flow_map"])
-        val_dataset   = FourDME_Dataset(dme_flow_cnn_root, is_train=False, transform=val_transform,
-                                         stats_path=stats_path if has_stats else None, keys=["flow_map"])
+        train_dataset = FourDME_Dataset(dme_mean_root, is_train=True,  transform=train_transform,
+                                         stats_path=stats_path if has_stats else None, keys=["flow_mean"])
+        val_dataset   = FourDME_Dataset(dme_mean_root, is_train=False, transform=val_transform,
+                                         stats_path=stats_path if has_stats else None, keys=["flow_mean"])
     else:
         cheo_root = os.path.join(data_dir, "cheo_dataset")
         train_dataset = DatasetCheo(json_path=os.path.join(cheo_root, "votes_train.json"), root_dir=cheo_root, transform=train_transform)

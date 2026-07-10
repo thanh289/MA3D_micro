@@ -37,7 +37,7 @@ def get_args():
     parser.add_argument("--seed", type=int, default=42)
 
     # Dataset
-    parser.add_argument("--data_type", default="RAF-DB", choices=["RAF-DB", "VKIST", "Cheo", "FerPlus", "Caers", "CheoFaMo", "4DME", "4DME_FLOW", "4DME_FLOW_CNN"])
+    parser.add_argument("--data_type", default="RAF-DB", choices=["RAF-DB", "VKIST", "Cheo", "FerPlus", "Caers", "CheoFaMo", "4DME", "4DME_FLOW", "4DME_FLOW_MEAN"])
     parser.add_argument("--num_classes", type=int, default=7)
     parser.add_argument("--class_names", type=str, default=None,
                         help="Comma-separated class names theo đúng thứ tự label index, "
@@ -58,14 +58,10 @@ def get_args():
                         help="Hidden dim của ThreeDMMEncoder. None -> 512 (SMIRK) hoặc "
                              "64 (flow) tuỳ theo x3d_dim được suy ra. Chỉ áp dụng khi "
                              "x3d_mode='mlp'.")
-    parser.add_argument("--x3d_mode", type=str, default="mlp", choices=["mlp", "cnn"],
+    parser.add_argument("--x3d_mode", type=str, default="mlp", choices=["mlp", "mean"],
                         help="'mlp': prior là vector đã pool (SMIRK 358-dim hoặc "
-                             "flow-pooled-vector 16-dim). 'cnn': prior là flow map thô "
-                             "chưa pool [n_roi, C, H, W], dùng ThreeDMMEncoderCNN.")
-    parser.add_argument("--x3d_channels", type=int, default=3,
-                        help="Số kênh input cho CNN encoder (vd 3 cho u,v,optical-strain). "
-                             "Chỉ áp dụng khi x3d_mode='cnn'.")
-    parser.add_argument("--use_sampler", action="store_true")
+                             "flow-pooled-vector 16-dim). 'mean': prior là composite flow "
+                             "map [3,42,42] (port kiến trúc MEAN_Recog), dùng ThreeDMMEncoderMEAN.")
 
     # Logging
     parser.add_argument("--log_file", type=str, default="log.txt")
@@ -197,16 +193,16 @@ def main():
     train_loader, val_loader = get_dataloaders(args)
 
     # Prior 3D: SMIRK (358-dim, 5 keys, mlp) mặc định; flow-pooled-vector
-    # (16-dim, 1 key, mlp) khi --data_type 4DME_FLOW; hoặc flow spatial map
-    # (1 key, cnn) khi --data_type 4DME_FLOW_CNN. Override thủ công qua
-    # --x3d_dim/--x3d_hidden_dim/--x3d_mode/--x3d_channels nếu cần.
-    if args.data_type == "4DME_FLOW_CNN":
-        x3d_keys = ["flow_map"]
-        x3d_dim = args.x3d_dim  # không dùng ở mode cnn, giữ None cho rõ ràng
-        x3d_hidden_dim = args.x3d_hidden_dim  # không dùng ở mode cnn
+    # (16-dim, 1 key, mlp) khi --data_type 4DME_FLOW; hoặc flow composite map
+    # (1 key, mean, port MEAN_Recog) khi --data_type 4DME_FLOW_MEAN. Override
+    # thủ công qua --x3d_dim/--x3d_hidden_dim/--x3d_mode nếu cần.
+    if args.data_type == "4DME_FLOW_MEAN":
+        x3d_keys = ["flow_mean"]
+        x3d_dim = args.x3d_dim  # không dùng ở mode mean, giữ None cho rõ ràng
+        x3d_hidden_dim = args.x3d_hidden_dim  # không dùng ở mode mean
         # chỉ override x3d_mode nếu người dùng chưa tự set khác "mlp" mặc định
         if args.x3d_mode == "mlp":
-            args.x3d_mode = "cnn"
+            args.x3d_mode = "mean"
     elif args.data_type == "4DME_FLOW":
         x3d_keys = ["flow"]
         x3d_dim = args.x3d_dim if args.x3d_dim is not None else 16
@@ -218,7 +214,7 @@ def main():
 
     model = MA3D(num_classes=args.num_classes, type=args.model_type,
                   x3d_dim=x3d_dim, x3d_hidden_dim=x3d_hidden_dim,
-                  x3d_mode=args.x3d_mode, x3d_channels=args.x3d_channels).to(device)
+                  x3d_mode=args.x3d_mode).to(device)
 
     if use_wandb and args.wandb_watch_model:
         wandb.watch(model, log="all", log_freq=100)
@@ -292,7 +288,6 @@ def main():
 
         best_val_acc = max(best_val_acc, val_acc)
 
-        #  save best ckpt (UF1 / macro-F1)
         #  save best ckpt (UF1 / macro-F1)
         if is_best:
             best_val_uf1 = val_uf1

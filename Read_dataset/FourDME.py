@@ -20,7 +20,8 @@ class FourDME_Dataset(Dataset):
         """
         keys: danh sách tên file .npy (không kể ".npy") tạo thành prior 3D.
             - None / mặc định : ["exp","jaw","eyelid","pose","shape"] (SMIRK, 358-dim tổng)
-            - ["flow"]        : prior mới từ optical flow (16-dim), xem run_inference_flow.py
+            - ["flow"]        : prior pool từ optical flow (16-dim), x3d_mode="mlp"
+            - ["flow_mean"]   : prior composite [3,42,42] (port MEAN_Recog), x3d_mode="mean"
         Thứ tự trong `keys` chính là thứ tự ghép nối trong engine.py::prepare_batch,
         cần giữ cố định để tương thích ngược với checkpoint đã train trước đó.
         """

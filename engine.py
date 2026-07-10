@@ -21,7 +21,7 @@ def prepare_batch(batch, device, x3d_keys=None):
         - None / mặc định: DEFAULT_X3D_KEYS (SMIRK, 358-dim, x3d_mode="mlp")
         - ["flow"]: prior mới từ optical flow. Có thể là:
             * vector đã pool (16-dim)          -> MA3D(x3d_mode="mlp")
-            * map thô [n_roi, C, H, W] chưa pool -> MA3D(x3d_mode="cnn")
+            * map thô [3, 42, 42] chưa pool -> MA3D(x3d_mode="mean")
           Với 1 key duy nhất, torch.cat(dim=1) chỉ là pass-through nên tensor
           giữ nguyên shape/rank (2D hay 5D đều đi qua được) -- không cần đổi
           gì ở đây khi chuyển giữa 2 mode, chỉ cần model (MA3D) khớp mode.
