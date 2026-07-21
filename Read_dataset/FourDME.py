@@ -3,174 +3,124 @@ import numpy as np
 import torch
 from PIL import Image
 from torch.utils.data import Dataset
-from collections import defaultdict
 
 EMOTION2IDX = {
-    "Negative": 0,
-    "Surprise": 1,
-    "Positive": 2,
-    "Others":   3,
+    "Negative":   0,
+    "Positive":   1,
+    "Surprise":   2,
+    "Repression": 3,
+    "Others":     4,
 }
 IDX2EMOTION = {v: k for k, v in EMOTION2IDX.items()}
 
 
 class FourDME_Dataset(Dataset):
-    def __init__(self, root_dir, is_train=True, transform=None,
-                 stats_path=None, verbose=False, keys=None):
-        """
-        keys: danh sách tên file .npy (không kể ".npy") tạo thành prior 3D.
-            - None / mặc định : ["exp","jaw","eyelid","pose","shape"] (SMIRK, 358-dim tổng)
-            - ["flow"]        : prior pool từ optical flow (16-dim), x3d_mode="mlp"
-            - ["flow_mean"]   : prior composite [3,42,42] (port MEAN_Recog), x3d_mode="mean"
-        Thứ tự trong `keys` chính là thứ tự ghép nối trong engine.py::prepare_batch,
-        cần giữ cố định để tương thích ngược với checkpoint đã train trước đó.
-        """
+    """
+    Reads samples produced by the updated run_inference_flow.py: a single
+    flat directory (root_dir) of sample folders -- no train/ or test/
+    subfolder anymore, since train/test membership is decided at LOSO-split
+    time (see build_dataloader.py::get_loso_dataloaders), not baked into
+    preprocessing.
 
+    Each sample folder is expected to contain:
+        inputs.png     -- apex frame, 224x224 RGB
+        onset.png      -- onset frame, 224x224 RGB
+        flow_map.npy   -- [n_roi, 3, H, W] optical-flow map (cnn mode)
+                           (or flow.npy, [n_roi*8] pooled vector, legacy
+                           'pool' mode -- see flow_key)
+        label.npy       -- scalar int64, index into EMOTION2IDX
+        fold.npy         -- original 4DME fold id, kept for reference only,
+                           NOT used to decide train/test membership anymore
+
+    Subject id is parsed from the folder name (see run_inference_flow.py:
+    f"{sub_id}_vid{...}_clip{...}_me{...}") and exposed via `self.subjects`,
+    a list parallel to `self.samples`, so LOSO (or any other subject-
+    grouped) split can be built externally, e.g. with
+    sklearn.model_selection.LeaveOneGroupOut.
+    """
+
+    def __init__(self, root_dir, transform=None, flow_key="flow_map", verbose=False):
+        """
+        flow_key: "flow_map" (spatial map, matches MotionEncoderCNN -- the
+            path used by the current architecture) or "flow" (pooled
+            vector, legacy 'mlp'-style mode, kept only for comparison).
+        transform: a PairedFaceTransform-like callable,
+            transform(apex_pil, onset_pil) -> (apex_tensor, onset_tensor).
+            A plain torchvision.transforms.Compose does NOT work here --
+            it has no notion of jointly transforming 2 images.
+        """
+        self.root_dir = root_dir
         self.transform = transform
-        split = "train" if is_train else "test"
-        self.data_dir = os.path.join(root_dir, split)
+        self.flow_key = flow_key
+        self.flow_filename = f"{flow_key}.npy"
 
-        if not os.path.exists(self.data_dir):
-            raise RuntimeError(f"Missing directory: {self.data_dir}")
+        if not os.path.exists(root_dir):
+            raise RuntimeError(f"Missing directory: {root_dir}")
 
-        # load normalization stats 
-        self.stats = None
-        if stats_path and os.path.exists(stats_path):
-            stats = np.load(stats_path)
-            self.stats = {k: torch.from_numpy(v).float() for k, v in stats.items()}
-
-        # keys của prior 3D: SMIRK (5 keys) mặc định, hoặc flow (1 key) nếu truyền vào
-        self.keys = keys if keys is not None else ["exp", "jaw", "eyelid", "pose", "shape"]
-
-        # scan dataset 
         self.samples = []
+        self.subjects = []
         skipped = 0
 
-
-        for folder in sorted(os.listdir(self.data_dir)):
-            path = os.path.join(self.data_dir, folder)
+        for folder in sorted(os.listdir(root_dir)):
+            path = os.path.join(root_dir, folder)
             if not os.path.isdir(path):
                 continue
 
-            img_path = os.path.join(path, "inputs.png")
+            apex_path  = os.path.join(path, "inputs.png")
+            onset_path = os.path.join(path, "onset.png")
+            flow_path  = os.path.join(path, self.flow_filename)
             label_path = os.path.join(path, "label.npy")
 
-            if not os.path.exists(img_path):
-                skipped += 1
-                continue
-            if not os.path.exists(label_path):
+            if not (os.path.exists(apex_path) and os.path.exists(onset_path)
+                    and os.path.exists(flow_path) and os.path.exists(label_path)):
                 skipped += 1
                 continue
 
-            # check full set of npy files
-            npy_files = [f for f in os.listdir(path) if f.endswith(".npy")]
-            missing = any(not os.path.exists(os.path.join(path, f"{k}.npy")) for k in self.keys)
-            if missing:
-                skipped += 1
-                continue
+            # Subject id = the part of the folder name before "_vid".
+            # NOTE: assumes SubID never itself contains the literal
+            # substring "_vid" -- true for typical short subject codes,
+            # but worth a quick sanity check if your SubID format is
+            # unusual (e.g. contains "_vid" as part of a longer code).
+            sub_id = folder.split("_vid")[0]
 
             self.samples.append({
-                "folder":   path,
-                "img_path": img_path,
+                "folder":     path,
+                "apex_path":  apex_path,
+                "onset_path": onset_path,
+                "flow_path":  flow_path,
+                "label_path": label_path,
             })
+            self.subjects.append(sub_id)
 
         if verbose:
-            print(f"[4DME] split={split} | samples={len(self.samples)} | skipped={skipped}")
-            # print class distribution
-            labels = [int(np.load(os.path.join(s["folder"], "label.npy"))) for s in self.samples]
+            print(f"[4DME] samples={len(self.samples)} | skipped={skipped} | "
+                  f"unique subjects={len(set(self.subjects))}")
+            labels = [int(np.load(s["label_path"])) for s in self.samples]
             for idx, name in IDX2EMOTION.items():
                 print(f"  {name}: {labels.count(idx)}")
 
     def __len__(self):
         return len(self.samples)
 
-    def _load_npy(self, folder, key):
-        path = os.path.join(folder, f"{key}.npy")
-        if not os.path.exists(path):
-            return None
-        x = torch.from_numpy(np.load(path)).float()
-        if self.stats and f"{key}_mean" in self.stats:
-            x = (x - self.stats[f"{key}_mean"]) / self.stats[f"{key}_std"]
-        return x
-
     def __getitem__(self, idx):
         s = self.samples[idx]
 
-        # image 
-        img = Image.open(s["img_path"]).convert("RGB")
-        if self.transform:
-            img = self.transform(img)
+        apex_img  = Image.open(s["apex_path"]).convert("RGB")
+        onset_img = Image.open(s["onset_path"]).convert("RGB")
 
-        # npy features 
-        features = {k: self._load_npy(s["folder"], k) for k in self.keys}
-        features = {k: v for k, v in features.items() if v is not None}
+        if self.transform is not None:
+            apex_t, onset_t = self.transform(apex_img, onset_img)
+        else:
+            # Fallback: bare, un-normalized tensors -- for debugging only.
+            apex_t = torch.from_numpy(np.array(apex_img)).permute(2, 0, 1).float() / 255.0
+            onset_t = torch.from_numpy(np.array(onset_img)).permute(2, 0, 1).float() / 255.0
 
-        label = int(np.load(os.path.join(s["folder"], "label.npy"))) 
+        flow = torch.from_numpy(np.load(s["flow_path"])).float()
+        label = int(np.load(s["label_path"]))
 
         return {
-            "image": img,
-            "npy":   features,
+            "apex":  apex_t,
+            "onset": onset_t,
+            "flow":  flow,
             "label": torch.tensor(label, dtype=torch.long),
         }
-
-
-def compute_4dme_stats(root_dir, split="train", output="4dme_stats.npz", keys=None):
-    """
-    keys: mặc định 5 keys SMIRK; truyền keys=["flow"] để tính stats cho prior mới
-    (flow.npy, 16-dim) sinh ra bởi run_inference_flow.py.
-    """
-    split_dir = os.path.join(root_dir, split)
-    keys = keys if keys is not None else ["exp", "jaw", "eyelid", "pose", "shape"]
-    buffers = defaultdict(list)
-    used = skipped = 0
-
-    for folder in os.listdir(split_dir):
-        path = os.path.join(split_dir, folder)
-        if not os.path.isdir(path):
-            continue
-
-        npy_files = [f for f in os.listdir(path) if f.endswith(".npy")]
-        if len(npy_files) < len(keys):
-            skipped += 1
-            continue
-
-        for key in keys:
-            fpath = os.path.join(path, f"{key}.npy")
-            if os.path.exists(fpath):
-                buffers[key].append(np.load(fpath))
-
-        used += 1
-
-    stats = {}
-    for k, v in buffers.items():
-        arr  = np.stack(v)
-        mean = arr.mean(0)
-        std  = arr.std(0)
-        std[std < 1e-6] = 1.0
-        stats[f"{k}_mean"] = mean
-        stats[f"{k}_std"]  = std
-        print(f"{k}: shape={mean.shape}")
-
-    out_path = os.path.join(root_dir, output)
-    np.savez(out_path, **stats)
-    print(f"Saved stats → {out_path}")
-    print(f"Used={used} | Skipped={skipped}")
-
-
-if __name__ == "__main__":
-
-    # SMIRK prior cũ (358-dim) — giữ để tương thích ngược
-    # compute_4dme_stats(
-    #     root_dir="D:/Learning/Lab/MICRO EXPRESSION/MA3D-Net/datasets/4dme_ma3d",
-    #     split="train",
-    #     output="4dme_stats.npz",
-    #     keys=["exp", "jaw", "eyelid", "pose", "shape"],
-    # )
-
-    # Flow prior mới (16-dim), dữ liệu sinh bởi run_inference_flow.py
-    compute_4dme_stats(
-        root_dir="D:/Learning/Lab/MICRO EXPRESSION/MA3D-Net/datasets/4dme_ma3d_flow",
-        split="train",
-        output="4dme_flow_stats.npz",
-        keys=["flow"],
-    )

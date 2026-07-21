@@ -5,7 +5,7 @@ from models.MA3D import MA3D
 from loss_function.loss import MarginAwareCELoss, LabelSmoothingCrossEntropy
 from models.sam import SAM
 
-from build_dataloader import get_dataloaders
+from build_dataloader import get_dataloaders, get_loso_dataloaders
 from engine import train_one_epoch, validate
 import time
 import shutil
@@ -20,7 +20,7 @@ from sklearn.metrics import (
 )
 import matplotlib.pyplot as plt
 import random
-import numpy as np
+
 
 def set_seed(seed: int):
     random.seed(seed)
@@ -37,11 +37,18 @@ def get_args():
     parser.add_argument("--seed", type=int, default=42)
 
     # Dataset
-    parser.add_argument("--data_type", default="RAF-DB", choices=["RAF-DB", "VKIST", "Cheo", "FerPlus", "Caers", "CheoFaMo", "4DME", "4DME_FLOW", "4DME_FLOW_MEAN"])
-    parser.add_argument("--num_classes", type=int, default=7)
+    parser.add_argument("--data_type", default="RAF-DB",
+                        choices=["RAF-DB", "VKIST", "Cheo", "FerPlus", "Caers",
+                                 "CheoFaMo", "4DME_MOTION"])
+    parser.add_argument("--num_classes", type=int, default=7,
+                        help="Default 7 is for the MaE datasets (RAF-DB etc). "
+                             "4DME_MOTION uses the 5-class scheme (Positive, "
+                             "Negative, Surprise, Repression, Others) -- pass "
+                             "--num_classes 5 explicitly when using it.")
     parser.add_argument("--class_names", type=str, default=None,
-                        help="Comma-separated class names theo đúng thứ tự label index, "
-                             "vd: 'Negative,Surprise,Positive,Others'. Mặc định dùng '0','1',...")
+                        help="Comma-separated class names in label-index order, "
+                             "e.g. 'Negative,Positive,Surprise,Repression,Others'. "
+                             "Defaults to '0','1',... if not given.")
 
     # Training
     parser.add_argument("--epochs", type=int, default=100)
@@ -49,19 +56,28 @@ def get_args():
     parser.add_argument("--lr", type=float, default=1e-5)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--num_workers", type=int, default=8)
-    parser.add_argument("--model_type", type=str, default="large", 
+    parser.add_argument("--model_type", type=str, default="large",
                     choices=["small", "base", "large"])
-    parser.add_argument("--x3d_dim", type=int, default=None,
-                        help="Chiều vector prior 3D. None -> tự suy ra theo data_type "
-                             "(358 cho '4DME'/SMIRK, 16 cho '4DME_FLOW').")
-    parser.add_argument("--x3d_hidden_dim", type=int, default=None,
-                        help="Hidden dim của ThreeDMMEncoder. None -> 512 (SMIRK) hoặc "
-                             "64 (flow) tuỳ theo x3d_dim được suy ra. Chỉ áp dụng khi "
-                             "x3d_mode='mlp'.")
-    parser.add_argument("--x3d_mode", type=str, default="mlp", choices=["mlp", "mean"],
-                        help="'mlp': prior là vector đã pool (SMIRK 358-dim hoặc "
-                             "flow-pooled-vector 16-dim). 'mean': prior là composite flow "
-                             "map [3,42,42] (port kiến trúc MEAN_Recog), dùng ThreeDMMEncoderMEAN.")
+
+    # MA3D architecture (motion / landmark-modulator / appearance-context)
+    parser.add_argument("--n_roi", type=int, default=3,
+                        help="Number of ROI in the flow map (eyebrow, eye, mouth). "
+                             "Must match the flow_map.npy produced by "
+                             "run_inference_flow.py.")
+    parser.add_argument("--landmark_embed_dim", type=int, default=256,
+                        help="Embedding dim of the landmark-derived FiLM "
+                             "condition vector (LandmarkPriorEncoder output).")
+    parser.add_argument("--num_film_blocks", type=int, default=5,
+                        help="Number of FiLM (LandmarkModulationFusion) blocks "
+                             "applied to the motion feature map.")
+
+    parser.add_argument("--use_sampler", action="store_true",
+                        help="Use a class-balanced WeightedRandomSampler for "
+                             "training instead of plain shuffling.")
+    parser.add_argument("--loso_debug_subject", type=str, default=None,
+                        help="4DME_MOTION only: restrict the LOSO loop to a "
+                             "single held-out subject, for quick smoke-testing "
+                             "of the pipeline without running all folds.")
 
     # Logging
     parser.add_argument("--log_file", type=str, default="log.txt")
@@ -125,57 +141,70 @@ def plot_confusion_matrix(y_true, y_pred, num_classes, class_names=None):
     return fig
 
 
-def save_checkpoint(state, resume_path, backup_dir, is_periodic=False, epoch=None):
+def save_checkpoint(state, resume_path, backup_dir, tag, is_periodic=False, epoch=None):
+    """
+    tag: fold identifier (e.g. held-out subject id) used to prefix backup
+    filenames, so different LOSO folds writing to the SAME backup_dir don't
+    overwrite each other. tag="" (empty string) for the non-LOSO case.
+    """
     torch.save(state, resume_path)
+
+    prefix = f"{tag}_" if tag else ""
 
     if is_periodic:
         for f in os.listdir(backup_dir):
-            if f.startswith("4dme_epoch") and f.endswith(".pth"):
+            if f.startswith(f"{prefix}4dme_epoch") and f.endswith(".pth"):
                 os.remove(os.path.join(backup_dir, f))
-        backup_name = f"4dme_epoch{epoch}.pth"
+        backup_name = f"{prefix}4dme_epoch{epoch}.pth"
     else:
-        backup_name = "4dme_best.pth"
+        backup_name = f"{prefix}4dme_best.pth"
 
     shutil.copy(resume_path, os.path.join(backup_dir, backup_name))
 
 
+def run_fold(args, train_loader, val_loader, device, fold_tag=None):
+    """
+    Runs one full training run (all epochs) on the given train/val loaders,
+    then returns (best_val_acc, best_val_uf1, uar_at_best_uf1).
 
-
-def main():
-    args = get_args()
-    set_seed(args.seed)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    os.makedirs(args.resume_dir, exist_ok=True)
-    os.makedirs(args.backup_dir, exist_ok=True)
-    resume_path = os.path.join(args.resume_dir, args.resume_name)
+    fold_tag: None for a regular (non-LOSO) run; a string (e.g. the
+    held-out subject id) when called from the LOSO loop in main() -- used
+    to keep checkpoints/logs/wandb runs from different folds separate.
+    """
+    tag_str = str(fold_tag) if fold_tag is not None else ""
+    resume_name = f"{tag_str}_{args.resume_name}" if fold_tag is not None else args.resume_name
+    resume_path = os.path.join(args.resume_dir, resume_name)
 
     # ---- Weights & Biases setup ----
     use_wandb = args.use_wandb
-    wandb_run_id = args.wandb_run_id 
+    wandb_run_id = args.wandb_run_id
 
     if use_wandb:
-        run_name = args.wandb_run_name or f"{args.data_type}_{time.strftime('%Y%m%d_%H%M%S')}"
+        base_name = args.wandb_run_name or f"{args.data_type}_{time.strftime('%Y%m%d_%H%M%S')}"
+        run_name = f"{base_name}_{tag_str}" if fold_tag is not None else base_name
         wandb.init(
             project=args.wandb_project,
             entity=args.wandb_entity,
             name=run_name,
-            id=wandb_run_id, 
+            id=wandb_run_id,
             resume="allow",
             mode=args.wandb_mode,
             config=vars(args),
+            reinit=True,
         )
-        # add epoch as a global step metric for better visualization in wandb
         wandb.define_metric("epoch")
         wandb.define_metric("*", step_metric="epoch")
 
     log_f = None
     if args.log_file is not None:
         os.makedirs("log", exist_ok=True)
-        log_path = os.path.join("log", args.log_file)
+        log_name = f"{tag_str}_{args.log_file}" if fold_tag is not None else args.log_file
+        log_path = os.path.join("log", log_name)
         log_f = open(log_path, "a")
         log_f.write(f"resume path / checkpoint path: {resume_path}\n")
         log_f.write(f"Batch_size: {args.batch_size}\n")
+        if fold_tag is not None:
+            log_f.write(f"LOSO fold -- held-out subject: {fold_tag}\n")
         log_f.flush()
         log_f.write(
             f"{'Epoch':^6} {'LR':^12} {'Train_Loss':^12} {'Train_Acc':^10} "
@@ -183,38 +212,15 @@ def main():
         )
         log_f.flush()
 
-
     class_names = args.class_names.split(",") if args.class_names else None
     if class_names and len(class_names) != args.num_classes:
         print(f"[WARN] --class_names has {len(class_names)} names but num_classes={args.num_classes}, "
               f"-> SKIP")
         class_names = None
 
-    train_loader, val_loader = get_dataloaders(args)
-
-    # Prior 3D: SMIRK (358-dim, 5 keys, mlp) mặc định; flow-pooled-vector
-    # (16-dim, 1 key, mlp) khi --data_type 4DME_FLOW; hoặc flow composite map
-    # (1 key, mean, port MEAN_Recog) khi --data_type 4DME_FLOW_MEAN. Override
-    # thủ công qua --x3d_dim/--x3d_hidden_dim/--x3d_mode nếu cần.
-    if args.data_type == "4DME_FLOW_MEAN":
-        x3d_keys = ["flow_mean"]
-        x3d_dim = args.x3d_dim  # không dùng ở mode mean, giữ None cho rõ ràng
-        x3d_hidden_dim = args.x3d_hidden_dim  # không dùng ở mode mean
-        # chỉ override x3d_mode nếu người dùng chưa tự set khác "mlp" mặc định
-        if args.x3d_mode == "mlp":
-            args.x3d_mode = "mean"
-    elif args.data_type == "4DME_FLOW":
-        x3d_keys = ["flow"]
-        x3d_dim = args.x3d_dim if args.x3d_dim is not None else 16
-        x3d_hidden_dim = args.x3d_hidden_dim if args.x3d_hidden_dim is not None else 64
-    else:
-        x3d_keys = ["exp", "jaw", "eyelid", "pose", "shape"]
-        x3d_dim = args.x3d_dim if args.x3d_dim is not None else 358
-        x3d_hidden_dim = args.x3d_hidden_dim  # None -> mặc định 512 trong ThreeDMMEncoder
-
     model = MA3D(num_classes=args.num_classes, type=args.model_type,
-                  x3d_dim=x3d_dim, x3d_hidden_dim=x3d_hidden_dim,
-                  x3d_mode=args.x3d_mode).to(device)
+                  n_roi=args.n_roi, landmark_embed_dim=args.landmark_embed_dim,
+                  num_film_blocks=args.num_film_blocks).to(device)
 
     if use_wandb and args.wandb_watch_model:
         wandb.watch(model, log="all", log_freq=100)
@@ -232,6 +238,7 @@ def main():
     start_epoch = 0
     best_val_acc = 0.0
     best_val_uf1 = 0.0
+    uar_at_best = 0.0
 
     if args.resume and os.path.exists(resume_path):
         print(f"Loading checkpoint from {resume_path}")
@@ -242,6 +249,7 @@ def main():
         start_epoch = checkpoint["epoch"] + 1
         best_val_acc = checkpoint.get("best_val_acc", 0.0)
         best_val_uf1 = checkpoint.get("best_val_uf1", 0.0)
+        uar_at_best = checkpoint.get("uar_at_best", 0.0)
         print(f"Resumed from epoch {start_epoch}, best_val_acc={best_val_acc:.4f}, best_val_uf1={best_val_uf1:.4f}")
         if wandb_run_id:
             print(f"wandb run_id: {wandb_run_id}")
@@ -252,12 +260,10 @@ def main():
         train_loss, train_acc, train_labels, train_preds = train_one_epoch(
             model, train_loader, CE_criterion, lsce_criterion,
             MA_criterion, optimizer, device, epoch, args.epochs,
-            x3d_keys=x3d_keys
         )
 
         val_loss, val_acc, val_labels, val_preds = validate(
             model, val_loader, CE_criterion, device, epoch, args.epochs,
-            x3d_keys=x3d_keys
         )
 
         val_uf1, val_uar, val_weighted_f1, val_report = compute_extra_metrics(
@@ -273,8 +279,9 @@ def main():
 
         epoch_time = (time.time() - epoch_start_time) / 60.0
 
-        # Use UF1 (macro-F1) for the "best" metric, acc is not good for unbalanced datasets, 
-        # especially when the majority class dominates. Still track best_val_acc in parallel.
+        # Use UF1 (macro-F1) for the "best" metric -- acc is not a good
+        # criterion for imbalanced datasets, especially when the majority
+        # class dominates. best_val_acc is still tracked in parallel.
         is_best = val_uf1 > best_val_uf1
 
         state = {
@@ -284,19 +291,21 @@ def main():
             "scheduler":    scheduler.state_dict(),
             "best_val_acc": max(best_val_acc, val_acc),
             "best_val_uf1": best_val_uf1 if not is_best else val_uf1,
+            "uar_at_best":  uar_at_best if not is_best else val_uar,
         }
 
         best_val_acc = max(best_val_acc, val_acc)
 
-        #  save best ckpt (UF1 / macro-F1)
+        # save best ckpt (UF1 / macro-F1)
         if is_best:
             best_val_uf1 = val_uf1
-            save_checkpoint(state, resume_path, args.backup_dir, is_periodic=False)
+            uar_at_best = val_uar
+            save_checkpoint(state, resume_path, args.backup_dir, tag_str, is_periodic=False)
             print(f"[Best] epoch={epoch+1}  val_acc={val_acc*100:.2f}%  "
                   f"UF1={val_uf1:.4f}  UAR={val_uar:.4f}")
 
-            np.save(os.path.join(args.backup_dir, "best_val_labels.npy"), val_labels)
-            np.save(os.path.join(args.backup_dir, "best_val_preds.npy"), val_preds)
+            np.save(os.path.join(args.backup_dir, f"{tag_str}_best_val_labels.npy" if tag_str else "best_val_labels.npy"), val_labels)
+            np.save(os.path.join(args.backup_dir, f"{tag_str}_best_val_preds.npy" if tag_str else "best_val_preds.npy"), val_preds)
 
             if use_wandb:
                 wandb.run.summary["best_val_acc"]  = best_val_acc
@@ -318,13 +327,13 @@ def main():
                 log_f.write(f"\tPer-class: {per_class}\n")
                 log_f.flush()
 
-        #  backup each N epoch 
+        # backup each N epoch
         if (epoch + 1) % args.backup_every == 0:
-            save_checkpoint(state, resume_path, args.backup_dir,
+            save_checkpoint(state, resume_path, args.backup_dir, tag_str,
                             is_periodic=True, epoch=epoch+1)
-            print(f"[Backup] epoch={epoch+1} → {args.backup_dir}/4dme_epoch{epoch+1}.pth")
+            print(f"[Backup] epoch={epoch+1} -> {args.backup_dir}/{tag_str}_4dme_epoch{epoch+1}.pth")
 
-        #  wandb log 
+        # wandb log
         if use_wandb:
             wandb.log({
                 "epoch": epoch + 1,
@@ -353,13 +362,68 @@ def main():
             )
             log_f.flush()
 
-    print(f"\nBest validation accuracy: {best_val_acc * 100:.2f}%  |  Best UF1 (macro-F1): {best_val_uf1:.4f}")
+    print(f"\n[{fold_tag if fold_tag is not None else 'run'}] "
+          f"Best validation accuracy: {best_val_acc * 100:.2f}%  |  "
+          f"Best UF1 (macro-F1): {best_val_uf1:.4f}  |  UAR at best: {uar_at_best:.4f}")
     if log_f:
-        log_f.write(f"\nBest validation accuracy: {best_val_acc * 100:.2f}%  |  Best UF1: {best_val_uf1:.4f}")
+        log_f.write(f"\nBest validation accuracy: {best_val_acc * 100:.2f}%  |  "
+                    f"Best UF1: {best_val_uf1:.4f}  |  UAR at best: {uar_at_best:.4f}")
         log_f.close()
 
     if use_wandb:
         wandb.finish()
+
+    return best_val_acc, best_val_uf1, uar_at_best
+
+
+def main():
+    args = get_args()
+    set_seed(args.seed)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    os.makedirs(args.resume_dir, exist_ok=True)
+    os.makedirs(args.backup_dir, exist_ok=True)
+
+    if args.data_type == "4DME_MOTION":
+        if args.num_classes != 5:
+            print(f"[WARN] data_type=4DME_MOTION but num_classes={args.num_classes} "
+                  f"(expected 5: Negative, Positive, Surprise, Repression, Others)")
+
+        splits = get_loso_dataloaders(args)
+        print(f"[LOSO] {len(splits)} subject folds queued")
+
+        fold_accs, fold_uf1s, fold_uars = [], [], []
+        for fold_idx, (train_loader, val_loader, held_out) in enumerate(splits):
+            print(f"\n=== Fold {fold_idx + 1}/{len(splits)} -- held-out subject: {held_out} ===")
+            best_acc, best_uf1, best_uar = run_fold(
+                args, train_loader, val_loader, device, fold_tag=held_out
+            )
+            fold_accs.append(best_acc)
+            fold_uf1s.append(best_uf1)
+            fold_uars.append(best_uar)
+
+        fold_accs = np.array(fold_accs)
+        fold_uf1s = np.array(fold_uf1s)
+        fold_uars = np.array(fold_uars)
+
+        summary = (
+            f"\n=== LOSO summary across {len(splits)} folds ===\n"
+            f"Acc : {fold_accs.mean() * 100:.2f}% (+/- {fold_accs.std() * 100:.2f})\n"
+            f"UF1 : {fold_uf1s.mean():.4f} (+/- {fold_uf1s.std():.4f})\n"
+            f"UAR : {fold_uars.mean():.4f} (+/- {fold_uars.std():.4f})\n"
+        )
+        print(summary)
+
+        os.makedirs("log", exist_ok=True)
+        with open(os.path.join("log", f"loso_summary_{args.log_file}"), "w") as f:
+            f.write(f"Per-fold Acc: {fold_accs.tolist()}\n")
+            f.write(f"Per-fold UF1: {fold_uf1s.tolist()}\n")
+            f.write(f"Per-fold UAR: {fold_uars.tolist()}\n")
+            f.write(summary)
+
+    else:
+        train_loader, val_loader = get_dataloaders(args)
+        run_fold(args, train_loader, val_loader, device, fold_tag=None)
 
 
 if __name__ == "__main__":
