@@ -48,7 +48,9 @@ class FourDME_Dataset(Dataset):
         transform: a PairedFaceTransform-like callable,
             transform(apex_pil, onset_pil) -> (apex_tensor, onset_tensor).
             A plain torchvision.transforms.Compose does NOT work here --
-            it has no notion of jointly transforming 2 images.
+            it has no notion of jointly transforming 2 images. Its `.train`
+            attribute (True/False) also gates whether flow augmentation is
+            applied in this dataset.
         """
         self.root_dir = root_dir
         self.transform = transform
@@ -119,9 +121,11 @@ class FourDME_Dataset(Dataset):
         flow_np = np.load(s["flow_path"])
         label = int(np.load(s["label_path"]))
 
+        # Augment on the NUMPY array, before any torch conversion (see
+        # class docstring for why order matters here).
         if getattr(self.transform, "train", False) and random.random() < 0.5:
-            flow_np = np.flip(flow_np, axis=-1).copy()    # flip width axis, mọi ROI
-            flow_np[:, 0, :, :] *= -1                     # kênh u (index 0) đổi dấu
+            flow_np = np.flip(flow_np, axis=-1).copy()  # flip width axis, every ROI
+            flow_np[:, 0, :, :] *= -1                    # u-channel (index 0): flip sign
 
         flow = torch.from_numpy(flow_np).float()
 

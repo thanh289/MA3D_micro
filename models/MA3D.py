@@ -7,9 +7,9 @@ from torch.nn import functional as F
 
 from .hyp_crossvit import *
 from .mobilefacenet import MobileFaceNet
-from .ir50 import Backbone
-from .ThreeDMM_Adaptive import LandmarkModulationFusion
+from .ThreeDMM_Adaptive import LandmarkModulationFusion, SpatialLandmarkModulationFusion
 from .motion_encoder import MotionEncoderCNN
+from .appearance_encoder import AppearanceEncoderViT
 
 
 def load_pretrained_weights(model, checkpoint):
@@ -71,26 +71,55 @@ class MA3D(nn.Module):
     instead of removed:
 
       - Motion branch (flow, MotionEncoderCNN, trained from scratch):
-        now the MAIN CONTENT branch (used to be the IR50-on-apex role).
-        Fed with the 3-ROI optical-flow map (eyebrow, eye, mouth).
+        the MAIN CONTENT branch (used to be the IR50-on-apex role in the
+        original MaE architecture). Fed with the 3-ROI optical-flow map
+        (eyebrow, eye, mouth).
 
-      - Landmark branch (MobileFaceNet, frozen): now the FiLM MODULATOR
-        (used to be the 3DMM-parameter role). Fed with APEX -- apex is
-        when the AU activation is most expressed, giving the most
-        informative "where on the face is this happening" signal.
-        No longer participates in cross-attention directly.
+      - Landmark branch (MobileFaceNet, frozen): the FiLM MODULATOR (used
+        to be the 3DMM-parameter role). Fed with APEX -- apex is when the
+        AU activation is most expressed, giving the most informative
+        "where on the face is this happening" signal. Does not
+        participate in cross-attention directly.
 
-      - Appearance-context branch (IR50, frozen): now the CROSS-ATTENTION
-        partner (used to be the landmark's role). Fed with ONSET -- a
-        neutral reference frame, avoiding redundancy with the AU-expressed
-        pose already carried by the motion+landmark branches.
+        Route B (decided): modulation is now SPATIAL, not
+        channel-only. The original FiLM (kept in ThreeDMM_Adaptive.py as
+        LandmarkModulationFusion, for comparison) pools the landmark map
+        down to a single vector and broadcasts (gamma, beta) uniformly
+        over the whole 7x7 motion map -- which cannot express "amplify
+        THIS region, not that one", even though that's exactly what this
+        branch is supposed to be doing. SpatialLandmarkModulationFusion
+        instead keeps the landmark map's 7x7 spatial grid (it's already
+        aligned 1:1 with the motion map's grid, no resize needed) and
+        produces a PER-POSITION (gamma, beta).
 
-    pyramid_fuse, SE_block and ClassificationHead are unchanged from the
-    original MaE architecture.
+      - Appearance-context branch: the CROSS-ATTENTION partner (used to be
+        the landmark's role in the original MaE architecture). Fed with
+        ONSET -- a neutral reference frame, avoiding redundancy with the
+        AU-expressed pose already carried by the motion+landmark branches.
+
+        Route C1 (decided): no longer a frozen, full-depth IR50.
+        IR50 here was trained under an ArcFace objective, whose explicit
+        goal is to become INVARIANT to expression (keep identity, discard
+        everything else) -- using it, frozen, to supply "where is this
+        expression happening" context works against what it was trained
+        to do, and that risk is larger for ME (an already-weak signal)
+        than it was in the MaE-domain original. AppearanceEncoderViT is a
+        shallow (depth=2), TRAINED-FROM-SCRATCH transformer instead,
+        borrowing GAMDSS's "vit_pos" design: the raw onset frame is
+        bilinearly downsampled directly to a 7x7 grid (no conv stem),
+        patchified with patch_size=1, then run through 2 Transformer
+        blocks -- deliberately shallow so it can't re-learn identity, only
+        coarse positional structure (same rationale TSFmicro and GAMDSS
+        both use for their equivalent "static/context" branch).
+
+    pyramid_fuse (bidirectional cross-attention), SE_block and
+    ClassificationHead are UNCHANGED -- Route B/C1 only swap what feeds
+    into them, not the fusion mechanism itself.
     """
 
     def __init__(self, img_size=224, num_classes=7, type="large",
-                 n_roi=3, landmark_embed_dim=256, num_film_blocks=5):
+                 n_roi=3, landmark_embed_dim=256, num_film_blocks=5,
+                 use_spatial_film=True):
         super().__init__()
         depth = 8
         if type == "small":
@@ -113,27 +142,33 @@ class MA3D(nn.Module):
         for param in self.face_landback.parameters():
             param.requires_grad = False
 
-        # --- Appearance-context branch (frozen) -- cross-attention partner ---
-        self.ir_back = Backbone(50, 0.0, 'ir')
-        ir_checkpoint = torch.load("checkpoints/ir50_o1.pth",
-                                   map_location=lambda storage, loc: storage)
-        self.ir_back = load_pretrained_weights(self.ir_back, ir_checkpoint)
-
-        for param in self.ir_back.parameters():
-            param.requires_grad = False
-
-        self.ir_layer = nn.Linear(1024, 512)
+        # --- Appearance-context branch (Route C1: shallow ViT, trained from
+        # scratch -- no checkpoint, no freezing; see class docstring) ---
+        self.appearance_encoder = AppearanceEncoderViT(
+            grid_size=7, embed_dim=512, depth=2, num_heads=4,
+        )
 
         # --- Motion branch (trained from scratch) -- main content ---
         self.motion_encoder = MotionEncoderCNN(n_roi=n_roi, out_channels=512)
 
         # --- Landmark-driven FiLM modulation of the motion feature map ---
-        self.landmark_fusion = LandmarkModulationFusion(
-            feat_nc=512,
-            embed_dim=landmark_embed_dim,
-            num_blocks=num_film_blocks,
-            landmark_dim=512,
-        )
+        self.use_spatial_film = use_spatial_film
+        if use_spatial_film:
+            # Route B: spatial (per-position) gamma/beta, see class docstring.
+            self.landmark_fusion = SpatialLandmarkModulationFusion(
+                feat_nc=512,
+                landmark_dim=512,
+                num_blocks=num_film_blocks,
+                hidden_dim=landmark_embed_dim // 2,
+            )
+        else:
+            # Original channel-only FiLM, kept available for comparison.
+            self.landmark_fusion = LandmarkModulationFusion(
+                feat_nc=512,
+                embed_dim=landmark_embed_dim,
+                num_blocks=num_film_blocks,
+                landmark_dim=512,
+            )
 
         # --- Cross-attention + classification head (unchanged) ---
         self.pyramid_fuse = HyVisionTransformer(in_chans=49, q_chanel=49, embed_dim=512,
@@ -154,17 +189,20 @@ class MA3D(nn.Module):
         # --- Landmark branch (frozen), fed with APEX ---
         x_apex_112 = F.interpolate(x_apex, size=112)
         _, x_lmk_map = self.face_landback(x_apex_112)               # [B, 512, 7, 7]
-        x_lmk_tokens = x_lmk_map.view(B, -1, 49).transpose(1, 2)    # [B, 49, 512]
 
-        # --- Appearance-context branch (frozen), fed with ONSET ---
-        x_appear = self.ir_back(x_onset).view(B, 49, 1024)
-        x_appear = self.ir_layer(x_appear)                          # [B, 49, 512]
+        # --- Appearance-context branch (Route C1: shallow ViT, trained from
+        # scratch), fed with ONSET ---
+        x_appear = self.appearance_encoder(x_onset)                 # [B, 49, 512]
 
         # --- Motion branch (trained from scratch), fed with the flow map ---
         x_motion = self.motion_encoder(x_flow)                      # [B, 512, 7, 7]
 
         # --- Landmark-driven FiLM modulation of the motion feature map ---
-        x_motion = self.landmark_fusion(x_motion, x_lmk_tokens)     # [B, 512, 7, 7]
+        if self.use_spatial_film:
+            x_motion = self.landmark_fusion(x_motion, x_lmk_map)    # [B, 512, 7, 7], spatial gamma/beta
+        else:
+            x_lmk_tokens = x_lmk_map.view(B, -1, 49).transpose(1, 2)  # [B, 49, 512]
+            x_motion = self.landmark_fusion(x_motion, x_lmk_tokens)   # [B, 512, 7, 7], channel-only gamma/beta
         x_motion = x_motion.view(B, 512, -1).transpose(1, 2)        # [B, 49, 512]
 
         # NOTE: pyramid_fuse(a, b) only returns the CLS token of the FIRST
