@@ -242,7 +242,7 @@ def run_fold(args, train_loader, val_loader, device, fold_tag=None):
 
     start_epoch = 0
     best_val_acc = 0.0
-    best_val_uf1 = 0.0
+    best_val_uf1 = -1.0
     uar_at_best = 0.0
 
     if args.resume and os.path.exists(resume_path):
@@ -253,7 +253,7 @@ def run_fold(args, train_loader, val_loader, device, fold_tag=None):
         scheduler.load_state_dict(checkpoint["scheduler"])
         start_epoch = checkpoint["epoch"] + 1
         best_val_acc = checkpoint.get("best_val_acc", 0.0)
-        best_val_uf1 = checkpoint.get("best_val_uf1", 0.0)
+        best_val_uf1 = checkpoint.get("best_val_uf1", -1.0)
         uar_at_best = checkpoint.get("uar_at_best", 0.0)
         print(f"Resumed from epoch {start_epoch}, best_val_acc={best_val_acc:.4f}, best_val_uf1={best_val_uf1:.4f}")
         if wandb_run_id:
