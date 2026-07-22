@@ -38,12 +38,13 @@ def train_one_epoch(model, loader, CE_criterion, lsce_criterion, MA_criterion,
 
         optimizer.zero_grad()
         loss.backward()
-        optimizer.first_step(zero_grad=True)
+        # optimizer.first_step(zero_grad=True)
+        optimizer.step()
 
-        logits_2, features_2, attn = model(apex, onset, flow)
-        loss_2 = get_loss(logits_2, labels, CE_criterion, lsce_criterion, MA_criterion, epoch)
-        loss_2.backward()
-        optimizer.second_step(zero_grad=True)
+        # logits_2, features_2, attn = model(apex, onset, flow)
+        # loss_2 = get_loss(logits_2, labels, CE_criterion, lsce_criterion, MA_criterion, epoch)
+        # loss_2.backward()
+        # optimizer.second_step(zero_grad=True)
 
         batch_size = labels.size(0)
         running_loss += loss.item() * batch_size

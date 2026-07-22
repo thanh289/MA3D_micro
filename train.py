@@ -230,9 +230,10 @@ def run_fold(args, train_loader, val_loader, device, fold_tag=None):
     MA_criterion = MarginAwareCELoss().to(device)
 
     base_optimizer = optim.AdamW
-    optimizer = SAM(model.parameters(), base_optimizer,
-                    lr=args.lr, weight_decay=args.weight_decay,
-                    rho=0.5, adaptive=True)
+    # optimizer = SAM(model.parameters(), base_optimizer,
+    #                 lr=args.lr, weight_decay=args.weight_decay,
+    #                 rho=0.5, adaptive=True)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.98)
 
     start_epoch = 0
@@ -372,6 +373,12 @@ def run_fold(args, train_loader, val_loader, device, fold_tag=None):
 
     if use_wandb:
         wandb.finish()
+
+    if os.path.exists(resume_path):
+        os.remove(resume_path)
+    for f in os.listdir(args.backup_dir):
+        if f.startswith(f"{tag_str}_4dme_epoch") and f.endswith(".pth"):
+            os.remove(os.path.join(args.backup_dir, f))
 
     return best_val_acc, best_val_uf1, uar_at_best
 

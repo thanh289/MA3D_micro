@@ -1,4 +1,5 @@
 import os
+import random
 import numpy as np
 import torch
 from PIL import Image
@@ -115,8 +116,14 @@ class FourDME_Dataset(Dataset):
             apex_t = torch.from_numpy(np.array(apex_img)).permute(2, 0, 1).float() / 255.0
             onset_t = torch.from_numpy(np.array(onset_img)).permute(2, 0, 1).float() / 255.0
 
-        flow = torch.from_numpy(np.load(s["flow_path"])).float()
+        flow_np = np.load(s["flow_path"])
         label = int(np.load(s["label_path"]))
+
+        if getattr(self.transform, "train", False) and random.random() < 0.5:
+            flow_np = np.flip(flow_np, axis=-1).copy()    # flip width axis, mọi ROI
+            flow_np[:, 0, :, :] *= -1                     # kênh u (index 0) đổi dấu
+
+        flow = torch.from_numpy(flow_np).float()
 
         return {
             "apex":  apex_t,
