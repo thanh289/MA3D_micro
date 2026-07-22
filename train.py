@@ -78,6 +78,10 @@ def get_args():
                         help="4DME_MOTION only: restrict the LOSO loop to a "
                              "single held-out subject, for quick smoke-testing "
                              "of the pipeline without running all folds.")
+    parser.add_argument("--early_stop_on_perfect_val", action="store_true",
+                        help="Stop training the current fold as soon as "
+                             "val_acc reaches 100%% right after saving the "
+                             "best checkpoint/predictions.")
 
     # Logging
     parser.add_argument("--log_file", type=str, default="log.txt")
@@ -327,6 +331,19 @@ def run_fold(args, train_loader, val_loader, device, fold_tag=None):
                 }
                 log_f.write(f"\tPer-class: {per_class}\n")
                 log_f.flush()
+
+            # Early stop THIS fold once val_acc hits 100%: the held-out
+            # val set is fixed, so every sample is already predicted
+            # correctly
+            if args.early_stop_on_perfect_val and val_acc >= 1.0:
+                print(f"[EarlyStop] epoch={epoch+1}  fold={fold_tag}  "
+                      f"val_acc=100% on {len(val_labels)} held-out sample(s) "
+                      f"-- stopping this fold early (pooled result can't "
+                      f"improve further).")
+                if log_f:
+                    log_f.write(f"EARLYSTOP\tepoch={epoch+1}\tval_acc=100%\n")
+                    log_f.flush()
+                break
 
         # backup each N epoch
         if (epoch + 1) % args.backup_every == 0:
