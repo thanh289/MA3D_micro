@@ -289,7 +289,7 @@ def run_fold(args, train_loader, val_loader, device, fold_tag=None):
             "model":        model.state_dict(),
             "optimizer":    optimizer.state_dict(),
             "scheduler":    scheduler.state_dict(),
-            "best_val_acc": max(best_val_acc, val_acc),
+            "best_val_acc": val_acc if is_best else best_val_acc,
             "best_val_uf1": best_val_uf1 if not is_best else val_uf1,
             "uar_at_best":  uar_at_best if not is_best else val_uar,
         }
