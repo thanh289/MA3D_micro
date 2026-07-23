@@ -149,8 +149,10 @@ def get_loso_dataloaders(args):
     train_tf = PairedFaceTransform(img_size=224, train=True)
     val_tf   = PairedFaceTransform(img_size=224, train=False)
 
-    dataset_train_view = FourDME_Dataset(root, transform=train_tf, flow_key="flow_map", verbose=True)
-    dataset_val_view   = FourDME_Dataset(root, transform=val_tf,   flow_key="flow_map")
+    dataset_train_view = FourDME_Dataset(root, transform=train_tf, flow_key="flow_map",
+                                          file_suffix="_gamdss", verbose=True)
+    dataset_val_view   = FourDME_Dataset(root, transform=val_tf,   flow_key="flow_map",
+                                          file_suffix="")
 
     subjects = np.array(dataset_train_view.subjects)
     n_subjects = len(set(subjects.tolist()))

@@ -15,6 +15,18 @@ EMOTION2IDX = {
 IDX2EMOTION = {v: k for k, v in EMOTION2IDX.items()}
 
 
+def _resolve_with_fallback(folder, suffixed_name, base_name, fallback_counter):
+    """Prefer the suffixed file (e.g. inputs_gamdss.png); if it doesn't
+    exist for this sample, fall back to the base file (inputs.png) and bump
+    fallback_counter[0]. The base file is assumed to always exist (checked
+    by the caller before this is used)"""
+    suffixed_path = os.path.join(folder, suffixed_name)
+    if os.path.exists(suffixed_path):
+        return suffixed_path
+    fallback_counter[0] += 1
+    return os.path.join(folder, base_name)
+
+
 class FourDME_Dataset(Dataset):
     """
     Reads samples produced by the updated run_inference_flow.py: a single
@@ -40,22 +52,20 @@ class FourDME_Dataset(Dataset):
     sklearn.model_selection.LeaveOneGroupOut.
     """
 
-    def __init__(self, root_dir, transform=None, flow_key="flow_map", verbose=False):
+    def __init__(self, root_dir, transform=None, flow_key="flow_map",
+                 file_suffix="", verbose=False):
         """
-        flow_key: "flow_map" (spatial map, matches MotionEncoderCNN -- the
-            path used by the current architecture) or "flow" (pooled
-            vector, legacy 'mlp'-style mode, kept only for comparison).
-        transform: a PairedFaceTransform-like callable,
-            transform(apex_pil, onset_pil) -> (apex_tensor, onset_tensor).
-            A plain torchvision.transforms.Compose does NOT work here --
-            it has no notion of jointly transforming 2 images. Its `.train`
-            attribute (True/False) also gates whether flow augmentation is
-            applied in this dataset.
+        flow_key: "flow_map" (spatial map) or "flow" (pooled vector).
+        file_suffix: "" reads the base files (inputs.png, onset.png,
+            flow_map.npy). "_gamdss" (or any other suffix produced by
+            run_inference_flow.py --suffix) prefers inputs_gamdss.png /
+            onset_gamdss.png / flow_map_gamdss.npy, falling back to the
+            base file per-sample if the suffixed one is missing.
         """
         self.root_dir = root_dir
         self.transform = transform
         self.flow_key = flow_key
-        self.flow_filename = f"{flow_key}.npy"
+        self.file_suffix = file_suffix
 
         if not os.path.exists(root_dir):
             raise RuntimeError(f"Missing directory: {root_dir}")
@@ -63,27 +73,35 @@ class FourDME_Dataset(Dataset):
         self.samples = []
         self.subjects = []
         skipped = 0
+        fallback_counter = [0]  # mutable int, shared across _resolve_with_fallback calls
 
         for folder in sorted(os.listdir(root_dir)):
             path = os.path.join(root_dir, folder)
             if not os.path.isdir(path):
                 continue
 
-            apex_path  = os.path.join(path, "inputs.png")
-            onset_path = os.path.join(path, "onset.png")
-            flow_path  = os.path.join(path, self.flow_filename)
-            label_path = os.path.join(path, "label.npy")
+            # Base files MUST exist -- these decide whether the sample is
+            # usable at all, independent of file_suffix.
+            base_apex_path  = os.path.join(path, "inputs.png")
+            base_onset_path = os.path.join(path, "onset.png")
+            base_flow_path  = os.path.join(path, f"{flow_key}.npy")
+            label_path      = os.path.join(path, "label.npy")
 
-            if not (os.path.exists(apex_path) and os.path.exists(onset_path)
-                    and os.path.exists(flow_path) and os.path.exists(label_path)):
+            if not (os.path.exists(base_apex_path) and os.path.exists(base_onset_path)
+                    and os.path.exists(base_flow_path) and os.path.exists(label_path)):
                 skipped += 1
                 continue
 
-            # Subject id = the part of the folder name before "_vid".
-            # NOTE: assumes SubID never itself contains the literal
-            # substring "_vid" -- true for typical short subject codes,
-            # but worth a quick sanity check if your SubID format is
-            # unusual (e.g. contains "_vid" as part of a longer code).
+            if file_suffix:
+                apex_path  = _resolve_with_fallback(
+                    path, f"inputs{file_suffix}.png", "inputs.png", fallback_counter)
+                onset_path = _resolve_with_fallback(
+                    path, f"onset{file_suffix}.png", "onset.png", fallback_counter)
+                flow_path  = _resolve_with_fallback(
+                    path, f"{flow_key}{file_suffix}.npy", f"{flow_key}.npy", fallback_counter)
+            else:
+                apex_path, onset_path, flow_path = base_apex_path, base_onset_path, base_flow_path
+
             sub_id = folder.split("_vid")[0]
 
             self.samples.append({
@@ -97,7 +115,8 @@ class FourDME_Dataset(Dataset):
 
         if verbose:
             print(f"[4DME] samples={len(self.samples)} | skipped={skipped} | "
-                  f"unique subjects={len(set(self.subjects))}")
+                  f"unique subjects={len(set(self.subjects))} | "
+                  f"file_suffix={file_suffix!r} | fallback_to_base={fallback_counter[0]}")
             labels = [int(np.load(s["label_path"])) for s in self.samples]
             for idx, name in IDX2EMOTION.items():
                 print(f"  {name}: {labels.count(idx)}")
@@ -114,18 +133,15 @@ class FourDME_Dataset(Dataset):
         if self.transform is not None:
             apex_t, onset_t = self.transform(apex_img, onset_img)
         else:
-            # Fallback: bare, un-normalized tensors -- for debugging only.
             apex_t = torch.from_numpy(np.array(apex_img)).permute(2, 0, 1).float() / 255.0
             onset_t = torch.from_numpy(np.array(onset_img)).permute(2, 0, 1).float() / 255.0
 
         flow_np = np.load(s["flow_path"])
         label = int(np.load(s["label_path"]))
 
-        # Augment on the NUMPY array, before any torch conversion (see
-        # class docstring for why order matters here).
         if getattr(self.transform, "train", False) and random.random() < 0.5:
-            flow_np = np.flip(flow_np, axis=-1).copy()  # flip width axis, every ROI
-            flow_np[:, 0, :, :] *= -1                    # u-channel (index 0): flip sign
+            flow_np = np.flip(flow_np, axis=-1).copy()
+            flow_np[:, 0, :, :] *= -1
 
         flow = torch.from_numpy(flow_np).float()
 
