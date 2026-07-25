@@ -70,6 +70,40 @@ def get_args():
     parser.add_argument("--num_film_blocks", type=int, default=5,
                         help="Number of FiLM (LandmarkModulationFusion) blocks "
                              "applied to the motion feature map.")
+    parser.add_argument("--use_rise_fall", action="store_true")
+    parser.add_argument("--rise_fall_mode", type=str, default="feature_gate",
+                        choices=["feature_gate", "decision_level"],
+                        help="Only has an effect when --use_rise_fall is set. "
+                             "'feature_gate': this codebase's own design (NOT a "
+                             "faithful port of any paper) -- rise/fall features "
+                             "combined via a cosine-similarity agreement map "
+                             "BEFORE landmark FiLM + pyramid_fuse; pyramid_fuse "
+                             "runs ONCE (cheaper). "
+                             "'decision_level': matches GAMDSS's actual BDRT "
+                             "class AND its real training script (verified) -- "
+                             "NO feature-level fusion; landmark FiLM + "
+                             "pyramid_fuse + head run TWICE (once per phase, "
+                             "shared weights), but the FINAL PREDICTION is the "
+                             "rise-phase output ONLY -- fall-phase output is "
+                             "used purely as an auxiliary loss term, never "
+                             "averaged in (matches GAMDSS exactly: predictions "
+                             "come from `ALL`, never from `s`). Roughly 2x the "
+                             "compute of feature_gate mode. See MA3D.py class "
+                             "docstring for full detail on both.")
+    parser.add_argument("--aux_loss_weight", type=float, default=0.2,
+                        help="Weight of the auxiliary rise-phase/fall-phase "
+                             "classification loss. Only has an effect when "
+                             "--use_rise_fall is set. NOTE for "
+                             "--rise_fall_mode decision_level: the main `out` "
+                             "IS out_rise already (see MA3D.py docstring -- "
+                             "GAMDSS's real training script only ever predicts "
+                             "from the rise-phase output, never an average), so "
+                             "only aux['fall'] is populated there (no double-"
+                             "counting). GAMDSS's real script sums CE(rise)+"
+                             "CE(fall) with an IMPLICIT weight of 1.0 -- try "
+                             "--aux_loss_weight 1.0 to match that exactly, "
+                             "vs. the lighter default 0.2 here.")
+    parser.add_argument("--use_gamdss", action="store_true")
 
     parser.add_argument("--use_sampler", action="store_true",
                         help="Use a class-balanced WeightedRandomSampler for "
@@ -224,7 +258,9 @@ def run_fold(args, train_loader, val_loader, device, fold_tag=None):
 
     model = MA3D(num_classes=args.num_classes, type=args.model_type,
                   n_roi=args.n_roi, landmark_embed_dim=args.landmark_embed_dim,
-                  num_film_blocks=args.num_film_blocks).to(device)
+                  num_film_blocks=args.num_film_blocks,
+                  use_rise_fall=args.use_rise_fall,
+                  rise_fall_mode=args.rise_fall_mode).to(device)
 
     if use_wandb and args.wandb_watch_model:
         wandb.watch(model, log="all", log_freq=100)
@@ -265,6 +301,7 @@ def run_fold(args, train_loader, val_loader, device, fold_tag=None):
         train_loss, train_acc, train_labels, train_preds = train_one_epoch(
             model, train_loader, CE_criterion, lsce_criterion,
             MA_criterion, optimizer, device, epoch, args.epochs,
+            aux_loss_weight=args.aux_loss_weight,
         )
 
         val_loss, val_acc, val_labels, val_preds = validate(

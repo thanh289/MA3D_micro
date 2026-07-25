@@ -149,9 +149,28 @@ def get_loso_dataloaders(args):
     train_tf = PairedFaceTransform(img_size=224, train=True)
     val_tf   = PairedFaceTransform(img_size=224, train=False)
 
+    use_rise_fall = getattr(args, "use_rise_fall", False)
+    use_gamdss    = getattr(args, "use_gamdss", False)
+
+    # Train view: optionally rise+fall motion, optionally GAMDSS-corrected
+    # files (per-sample, per-file fallback to the base file if the
+    # corrected version is missing -- see FourDME.py).
+    # Val view: ALWAYS the original (non-GAMDSS) files -- deliberate design
+    # decision from chat: GAMDSS's own reference protocol only relabels the
+    # train side, keeping evaluation on the officially annotated
+    # key-frames so results stay comparable to other papers' benchmarks.
+    # use_rise_fall, however, applies to BOTH views -- a model trained with
+    # a rise+fall input signature needs fall-phase input at val time too,
+    # to actually exercise that branch; only file_suffix (gamdss vs.
+    # original) differs between train/val, not which files get loaded.
     dataset_train_view = FourDME_Dataset(root, transform=train_tf, flow_key="flow_map",
-                                          file_suffix="_gamdss", verbose=True)
+                                          flow_fall_key="flow_map_fall",
+                                          use_rise_fall=use_rise_fall,
+                                          file_suffix="_gamdss" if use_gamdss else "",
+                                          verbose=True)
     dataset_val_view   = FourDME_Dataset(root, transform=val_tf,   flow_key="flow_map",
+                                          flow_fall_key="flow_map_fall",
+                                          use_rise_fall=use_rise_fall,
                                           file_suffix="")
 
     subjects = np.array(dataset_train_view.subjects)
