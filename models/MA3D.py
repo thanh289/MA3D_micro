@@ -9,6 +9,7 @@ from .hyp_crossvit import *
 from .mobilefacenet import MobileFaceNet
 from .ThreeDMM_Adaptive import LandmarkModulationFusion, SpatialLandmarkModulationFusion
 from .motion_encoder import MotionEncoderCNN
+from .motion_encoder_rmt import RMTMotionEncoder
 from .appearance_encoder import AppearanceEncoderViT
 from .rise_fall_fusion import RiseFallAgreementFusion
 
@@ -166,12 +167,33 @@ class MA3D(nn.Module):
 
     When use_rise_fall=False, forward() behaves exactly like the original
     single-phase (rise-only) version regardless of rise_fall_mode.
+
+    motion_backbone (decided in chat, GAMDSS-inspired): swaps WHAT encodes
+    motion, orthogonal to use_rise_fall/rise_fall_mode above (works with
+    either):
+
+      - motion_backbone="cnn" (default, unchanged): MotionEncoderCNN,
+        trained from scratch, operating on the 3-ROI-cropped flow map
+        (x_flow_rise / x_flow_fall, [B, n_roi, 3, H, W] -- eyebrow, eye,
+        mouth crops from run_inference_flow.py).
+
+      - motion_backbone="rmt": RMTMotionEncoder (motion_encoder_rmt.py),
+        wrapping GAMDSS's real RMT_T3/VisRetNet retention-based backbone
+        (RMT.py, copied verbatim from GAMDSS's source). Operates on a
+        WHOLE-FACE pixel-diff instead of ROI crops -- GAMDSS's real
+        architecture has no ROI-cropping concept at all -- computed ON THE
+        FLY inside forward() from the already-available RGB frames
+        (rise: x_apex - x_onset; fall: x_offset - x_apex, x_offset being a
+        NEW optional forward() argument), NOT from flow_map.npy/
+        flow_map_fall.npy at all (those are ignored when motion_backbone=
+        "rmt", though still required as positional args for interface
+        compatibility -- pass anything of the right shape, e.g. zeros).
     """
 
     def __init__(self, img_size=224, num_classes=7, type="large",
                  n_roi=3, landmark_embed_dim=256, num_film_blocks=5,
                  use_spatial_film=True, use_rise_fall=True,
-                 rise_fall_mode="feature_gate"):
+                 rise_fall_mode="feature_gate", motion_backbone="cnn"):
         super().__init__()
         depth = 8
         if type == "small":
@@ -188,6 +210,10 @@ class MA3D(nn.Module):
         assert rise_fall_mode in ("feature_gate", "decision_level"), \
             f"rise_fall_mode must be 'feature_gate' or 'decision_level', got {rise_fall_mode!r}"
         self.rise_fall_mode = rise_fall_mode
+
+        assert motion_backbone in ("cnn", "rmt"), \
+            f"motion_backbone must be 'cnn' or 'rmt', got {motion_backbone!r}"
+        self.motion_backbone = motion_backbone
 
         # --- Landmark branch (frozen) -- FiLM modulator source ---
         self.face_landback = MobileFaceNet([112, 112], 136)
@@ -210,7 +236,10 @@ class MA3D(nn.Module):
         # called TWICE in forward() (once on flow_rise, once on flow_fall)
         # -- this IS the "share-weight" design agreed in chat, not two
         # separate encoders.
-        self.motion_encoder = MotionEncoderCNN(n_roi=n_roi, out_channels=512)
+        if motion_backbone == "cnn":
+            self.motion_encoder = MotionEncoderCNN(n_roi=n_roi, out_channels=512)
+        else:  # "rmt"
+            self.motion_encoder = RMTMotionEncoder()
 
         if use_rise_fall and rise_fall_mode == "feature_gate":
             self.rise_fall_fusion = RiseFallAgreementFusion()
@@ -280,16 +309,25 @@ class MA3D(nn.Module):
         out = self.head(y_hat)
         return out, y_feat, attn_all
 
-    def forward(self, x_apex, x_onset, x_flow_rise, x_flow_fall=None):
+    def forward(self, x_apex, x_onset, x_flow_rise, x_flow_fall=None, x_offset=None):
         """
-        x_apex      : [B, 3, 224, 224] RGB apex frame  -> landmark/modulator branch
-        x_onset     : [B, 3, 224, 224] RGB onset frame -> appearance-context branch
+        x_apex      : [B, 3, 224, 224] RGB apex frame  -> landmark/modulator branch,
+                      also used as rise-phase diff source when motion_backbone="rmt"
+        x_onset     : [B, 3, 224, 224] RGB onset frame -> appearance-context branch,
+                      also used as rise-phase diff source when motion_backbone="rmt"
         x_flow_rise : [B, n_roi, 3, H, W] onset->apex flow map (u, v, strain
-                      per ROI) -> motion branch
+                      per ROI) -> motion branch. IGNORED when
+                      motion_backbone="rmt" (still required positionally,
+                      any correctly-shaped tensor works, e.g. zeros).
         x_flow_fall : [B, n_roi, 3, H, W] apex->offset flow map, SAME shape
                       as x_flow_rise -> motion branch, SHARED weights.
-                      REQUIRED when self.use_rise_fall=True, ignored
-                      otherwise.
+                      REQUIRED when self.use_rise_fall=True AND
+                      motion_backbone="cnn"; IGNORED when motion_backbone=
+                      "rmt" (x_offset is used instead, see below).
+        x_offset    : [B, 3, 224, 224] RGB offset frame. ONLY used when
+                      motion_backbone="rmt" AND self.use_rise_fall=True
+                      (to compute the fall-phase whole-face diff,
+                      x_offset - x_apex) -- unused/ignored otherwise.
 
         Returns: out, y_feat, attn_all, aux
             aux = {
@@ -318,19 +356,31 @@ class MA3D(nn.Module):
 
         aux = {"rise": None, "fall": None, "agreement": None}
 
+        # --- Motion branch input: either the ROI-cropped flow map (cnn) or
+        # a whole-face RGB diff computed on the fly (rmt) -- see class
+        # docstring on motion_backbone.
+        if self.motion_backbone == "cnn":
+            motion_input_rise = x_flow_rise
+            motion_input_fall = x_flow_fall
+        else:  # "rmt"
+            motion_input_rise = x_apex - x_onset
+            motion_input_fall = (x_offset - x_apex) if x_offset is not None else None
+
         if not self.use_rise_fall:
             # Original single-phase (rise-only) behaviour, unchanged.
-            x_motion = self.motion_encoder(x_flow_rise)              # [B, 512, 7, 7]
+            x_motion = self.motion_encoder(motion_input_rise)        # [B, 512, 7, 7]
             out, y_feat, attn_all = self._film_and_classify(x_motion, x_lmk_map, x_appear, B)
             return out, y_feat, attn_all, aux
 
-        assert x_flow_fall is not None, \
-            "use_rise_fall=True requires x_flow_fall (apex->offset flow map)"
+        assert motion_input_fall is not None, (
+            "use_rise_fall=True requires x_flow_fall (motion_backbone='cnn') "
+            "or x_offset (motion_backbone='rmt')"
+        )
 
         # SAME motion_encoder instance called twice -- shared weights,
-        # regardless of rise_fall_mode.
-        x_motion_rise = self.motion_encoder(x_flow_rise)        # [B, 512, 7, 7]
-        x_motion_fall = self.motion_encoder(x_flow_fall)        # [B, 512, 7, 7]
+        # regardless of rise_fall_mode or motion_backbone.
+        x_motion_rise = self.motion_encoder(motion_input_rise)        # [B, 512, 7, 7]
+        x_motion_fall = self.motion_encoder(motion_input_fall)        # [B, 512, 7, 7]
 
         if self.rise_fall_mode == "feature_gate":
             # Auxiliary per-phase classification (small heads, on pooled

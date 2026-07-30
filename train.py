@@ -90,20 +90,18 @@ def get_args():
                              "come from `ALL`, never from `s`). Roughly 2x the "
                              "compute of feature_gate mode. See MA3D.py class "
                              "docstring for full detail on both.")
-    parser.add_argument("--aux_loss_weight", type=float, default=0.2,
-                        help="Weight of the auxiliary rise-phase/fall-phase "
-                             "classification loss. Only has an effect when "
-                             "--use_rise_fall is set. NOTE for "
-                             "--rise_fall_mode decision_level: the main `out` "
-                             "IS out_rise already (see MA3D.py docstring -- "
-                             "GAMDSS's real training script only ever predicts "
-                             "from the rise-phase output, never an average), so "
-                             "only aux['fall'] is populated there (no double-"
-                             "counting). GAMDSS's real script sums CE(rise)+"
-                             "CE(fall) with an IMPLICIT weight of 1.0 -- try "
-                             "--aux_loss_weight 1.0 to match that exactly, "
-                             "vs. the lighter default 0.2 here.")
-    parser.add_argument("--use_gamdss", action="store_true")
+    parser.add_argument("--aux_loss_weight", type=float, default=0.2)
+    parser.add_argument("--motion_backbone", type=str, default="cnn",
+                        choices=["cnn", "rmt"])
+    parser.add_argument("--use_gamdss", action="store_true",
+                        help="4DME_MOTION only: TRAIN view reads the GAMDSS "
+                             "dynamic-frame-reselection-corrected files "
+                             "(inputs_gamdss.png, onset_gamdss.png, "
+                             "flow_map_gamdss.npy, flow_map_fall_gamdss.npy). "
+                             "VAL view is UNAFFECTED -- always reads the "
+                             "original files, by design (only train gets "
+                             "relabeled, evaluation stays on official "
+                             "annotations -- see chat notes).")
 
     parser.add_argument("--use_sampler", action="store_true",
                         help="Use a class-balanced WeightedRandomSampler for "
@@ -260,7 +258,8 @@ def run_fold(args, train_loader, val_loader, device, fold_tag=None):
                   n_roi=args.n_roi, landmark_embed_dim=args.landmark_embed_dim,
                   num_film_blocks=args.num_film_blocks,
                   use_rise_fall=args.use_rise_fall,
-                  rise_fall_mode=args.rise_fall_mode).to(device)
+                  rise_fall_mode=args.rise_fall_mode,
+                  motion_backbone=args.motion_backbone).to(device)
 
     if use_wandb and args.wandb_watch_model:
         wandb.watch(model, log="all", log_freq=100)

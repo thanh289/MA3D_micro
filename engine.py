@@ -58,8 +58,9 @@ def prepare_batch(batch, device):
     onset = batch["onset"].to(device, non_blocking=True)
     flow_rise = batch["flow_rise"].to(device, non_blocking=True)
     flow_fall = batch["flow_fall"].to(device, non_blocking=True) if "flow_fall" in batch else None
+    offset = batch["offset"].to(device, non_blocking=True) if "offset" in batch else None
     labels = batch["label"].to(device, non_blocking=True)
-    return apex, onset, flow_rise, flow_fall, labels
+    return apex, onset, flow_rise, flow_fall, offset, labels
 
 
 def train_one_epoch(model, loader, CE_criterion, lsce_criterion, MA_criterion,
@@ -72,9 +73,9 @@ def train_one_epoch(model, loader, CE_criterion, lsce_criterion, MA_criterion,
     for batch_idx, batch in enumerate(
         tqdm(loader, desc=f"Training [{epoch + 1}/{epochs}]", leave=False)
     ):
-        apex, onset, flow_rise, flow_fall, labels = prepare_batch(batch, device)
+        apex, onset, flow_rise, flow_fall, offset, labels = prepare_batch(batch, device)
 
-        logits, features, attn, aux = model(apex, onset, flow_rise, flow_fall)
+        logits, features, attn, aux = model(apex, onset, flow_rise, flow_fall, offset)
         loss = get_loss(logits, labels, CE_criterion, lsce_criterion, MA_criterion, epoch,
                          aux=aux, aux_loss_weight=aux_loss_weight)
 
@@ -83,7 +84,7 @@ def train_one_epoch(model, loader, CE_criterion, lsce_criterion, MA_criterion,
         # optimizer.first_step(zero_grad=True)
         optimizer.step()
 
-        # logits_2, features_2, attn, aux_2 = model(apex, onset, flow_rise, flow_fall)
+        # logits_2, features_2, attn, aux_2 = model(apex, onset, flow_rise, flow_fall, offset)
         # loss_2 = get_loss(logits_2, labels, CE_criterion, lsce_criterion, MA_criterion, epoch,
         #                    aux=aux_2, aux_loss_weight=aux_loss_weight)
         # loss_2.backward()
@@ -121,9 +122,9 @@ def validate(model, loader, criterion, device, epoch, epochs):
     all_labels, all_preds = [], []
 
     for batch in tqdm(loader, desc=f"Validation [{epoch + 1}/{epochs}]", leave=False):
-        apex, onset, flow_rise, flow_fall, labels = prepare_batch(batch, device)
+        apex, onset, flow_rise, flow_fall, offset, labels = prepare_batch(batch, device)
 
-        logits, features, attn, aux = model(apex, onset, flow_rise, flow_fall)
+        logits, features, attn, aux = model(apex, onset, flow_rise, flow_fall, offset)
         loss = criterion(logits, labels)
 
         running_loss += loss.item() * labels.size(0)

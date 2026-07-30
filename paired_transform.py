@@ -24,6 +24,8 @@ class PairedFaceTransform:
     The actual ME motion signal (the flow map) never goes through this
     transform at all -- it's precomputed offline by run_inference_flow.py
     and loaded as a raw array, so none of this augmentation touches it.
+    Extended (optional 3rd argument) to also jointly transform an OFFSET
+    frame with the SAME ColorJitter draw as apex/onset
     """
 
     def __init__(self, img_size=224, train=True,
@@ -40,9 +42,11 @@ class PairedFaceTransform:
             self.jitter_saturation = jitter_saturation
             self.random_erasing = T.RandomErasing(p=1, scale=erase_scale)
 
-    def __call__(self, apex_img, onset_img):
+    def __call__(self, apex_img, onset_img, offset_img=None):
         apex_img = TF.resize(apex_img, [self.img_size, self.img_size])
         onset_img = TF.resize(onset_img, [self.img_size, self.img_size])
+        if offset_img is not None:
+            offset_img = TF.resize(offset_img, [self.img_size, self.img_size])
 
         if self.train:
             fn_idx, b, c, s, h = T.ColorJitter.get_params(
@@ -53,16 +57,25 @@ class PairedFaceTransform:
             )
             apex_img = self._apply_jitter(apex_img, fn_idx, b, c, s, h)
             onset_img = self._apply_jitter(onset_img, fn_idx, b, c, s, h)
+            if offset_img is not None:
+                offset_img = self._apply_jitter(offset_img, fn_idx, b, c, s, h)
 
         apex_t = TF.to_tensor(apex_img)
         onset_t = TF.to_tensor(onset_img)
         apex_t = self.normalize(apex_t)
         onset_t = self.normalize(onset_t)
+        if offset_img is not None:
+            offset_t = TF.to_tensor(offset_img)
+            offset_t = self.normalize(offset_t)
 
         if self.train:
             apex_t = self.random_erasing(apex_t)
             onset_t = self.random_erasing(onset_t)
+            if offset_img is not None:
+                offset_t = self.random_erasing(offset_t)
 
+        if offset_img is not None:
+            return apex_t, onset_t, offset_t
         return apex_t, onset_t
 
     @staticmethod
