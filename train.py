@@ -432,6 +432,8 @@ def run_fold(args, train_loader, val_loader, device, fold_tag=None):
     for f in os.listdir(args.backup_dir):
         if f.startswith(f"{tag_str}_4dme_epoch") and f.endswith(".pth"):
             os.remove(os.path.join(args.backup_dir, f))
+        if f.startswith(f"{tag_str}_4dme_best") and f.endswith(".pth"):
+            os.remove(os.path.join(args.backup_dir, f))
 
     return best_val_acc, best_val_uf1, uar_at_best
 
