@@ -152,6 +152,7 @@ def get_loso_dataloaders(args):
     use_rise_fall = getattr(args, "use_rise_fall", False)
     use_gamdss    = getattr(args, "use_gamdss", False)
     load_offset   = getattr(args, "motion_backbone", "cnn") == "rmt"
+    load_au       = getattr(args, "use_au", False)
 
     # Train view: optionally rise+fall motion, optionally GAMDSS-corrected
     # files (per-sample, per-file fallback to the base file if the
@@ -164,21 +165,23 @@ def get_loso_dataloaders(args):
     # decision from chat: GAMDSS's own reference protocol only relabels the
     # train side, keeping evaluation on the officially annotated
     # key-frames so results stay comparable to other papers' benchmarks.
-    # use_rise_fall/load_offset, however, apply to BOTH views -- a model
-    # trained with a given input signature needs the same inputs at val
-    # time too, to actually exercise every branch; only file_suffix
+    # use_rise_fall/load_offset/load_au, however, apply to BOTH views -- a
+    # model trained with a given input signature needs the same inputs at
+    # val time too, to actually exercise every branch; only file_suffix
     # (gamdss vs. original) differs between train/val, not which files
     # get loaded.
     dataset_train_view = FourDME_Dataset(root, transform=train_tf, flow_key="flow_map",
                                           flow_fall_key="flow_map_fall",
                                           use_rise_fall=use_rise_fall,
                                           load_offset=load_offset,
+                                          load_au=load_au,
                                           file_suffix="_gamdss" if use_gamdss else "",
                                           verbose=True)
     dataset_val_view   = FourDME_Dataset(root, transform=val_tf,   flow_key="flow_map",
                                           flow_fall_key="flow_map_fall",
                                           use_rise_fall=use_rise_fall,
                                           load_offset=load_offset,
+                                          load_au=load_au,
                                           file_suffix="")
 
     subjects = np.array(dataset_train_view.subjects)

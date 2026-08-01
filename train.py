@@ -93,6 +93,8 @@ def get_args():
     parser.add_argument("--aux_loss_weight", type=float, default=0.2)
     parser.add_argument("--motion_backbone", type=str, default="cnn",
                         choices=["cnn", "rmt"])
+    parser.add_argument("--use_au", action="store_true")
+    parser.add_argument("--au_embed_dim", type=int, default=128)
     parser.add_argument("--use_gamdss", action="store_true",
                         help="4DME_MOTION only: TRAIN view reads the GAMDSS "
                              "dynamic-frame-reselection-corrected files "
@@ -259,7 +261,9 @@ def run_fold(args, train_loader, val_loader, device, fold_tag=None):
                   num_film_blocks=args.num_film_blocks,
                   use_rise_fall=args.use_rise_fall,
                   rise_fall_mode=args.rise_fall_mode,
-                  motion_backbone=args.motion_backbone).to(device)
+                  motion_backbone=args.motion_backbone,
+                  use_au=args.use_au,
+                  au_embed_dim=args.au_embed_dim).to(device)
 
     if use_wandb and args.wandb_watch_model:
         wandb.watch(model, log="all", log_freq=100)

@@ -155,7 +155,29 @@ class MA3D(nn.Module):
         useful gradient signal for the shared weights via the auxiliary
         loss.
 
-      NOTE for rise_fall_mode="decision_level": GAMDSS's real BDRT also
+    AU-guidance branch (use_au, added inspired by STAG's "AU Guidance"
+    step -- STAG itself has no public code, this is our own design, not a
+    port): OPTIONAL side branch, orthogonal to everything above (works
+    with any use_rise_fall/rise_fall_mode/motion_backbone combination).
+
+      x_au [B, au_dim] (au_dim=36 by default: 18 dynamic-AU one-hot +
+      18 static-AU "(k)" one-hot slots, see au_utils.py for the parsing
+      convention and the exact vocab) -> au_encoder (2-layer MLP, matches
+      STAG's own "binary AU vector -> MLP -> f_au" design) -> au_embed
+      [B, au_embed_dim] -> CONCATENATED onto the pooled fusion feature
+      (post se_block, pre head) -> head's input_dim becomes
+      512 + au_embed_dim instead of 512.
+
+      Applied inside _film_and_classify (the shared tail), so in
+      rise_fall_mode="decision_level" the SAME au_embed (computed once in
+      forward(), not per-phase -- AU annotation is a property of the
+      whole clip, not of rise vs. fall separately) is concatenated on
+      BOTH the rise-phase and fall-phase passes.
+
+      When use_au=False (default), behaves exactly as before -- x_au is
+      simply ignored, head's input_dim stays 512.
+
+    NOTE for rise_fall_mode="decision_level": GAMDSS's real BDRT also
       sources the position-calibration branch from a DIFFERENT frame per
       phase (onset for rise, apex for fall). This codebase does NOT
       replicate that -- the landmark branch stays fixed on APEX and the
@@ -193,7 +215,8 @@ class MA3D(nn.Module):
     def __init__(self, img_size=224, num_classes=7, type="large",
                  n_roi=3, landmark_embed_dim=256, num_film_blocks=5,
                  use_spatial_film=True, use_rise_fall=True,
-                 rise_fall_mode="feature_gate", motion_backbone="cnn"):
+                 rise_fall_mode="feature_gate", motion_backbone="cnn",
+                 use_au=False, au_dim=36, au_embed_dim=128):
         super().__init__()
         depth = 8
         if type == "small":
@@ -214,6 +237,8 @@ class MA3D(nn.Module):
         assert motion_backbone in ("cnn", "rmt"), \
             f"motion_backbone must be 'cnn' or 'rmt', got {motion_backbone!r}"
         self.motion_backbone = motion_backbone
+
+        self.use_au = use_au
 
         # --- Landmark branch (frozen) -- FiLM modulator source ---
         self.face_landback = MobileFaceNet([112, 112], 136)
@@ -277,19 +302,40 @@ class MA3D(nn.Module):
                                              drop_rate=0., attn_drop_rate=0., drop_path_rate=0.1)
 
         self.se_block = SE_block(input_dim=512)
-        self.head = ClassificationHead(input_dim=512, target_dim=self.num_classes)
 
-    def _film_and_classify(self, x_motion, x_lmk_map, x_appear, B):
+        # --- Optional AU-guidance branch (STAG-inspired, our own design) ---
+        # 2-layer MLP over the multi-hot AU vector -> au_embed, concatenated
+        # onto the pooled fusion feature right before the head. See class
+        # docstring and au_utils.py for the vector convention.
+        head_input_dim = 512
+        if use_au:
+            self.au_encoder = nn.Sequential(
+                nn.Linear(au_dim, au_embed_dim),
+                nn.ReLU(inplace=True),
+                nn.Linear(au_embed_dim, au_embed_dim),
+            )
+            head_input_dim = 512 + au_embed_dim
+
+        self.head = ClassificationHead(input_dim=head_input_dim, target_dim=self.num_classes)
+
+    def _film_and_classify(self, x_motion, x_lmk_map, x_appear, B, au_embed=None):
         """
         Shared tail of the pipeline: landmark FiLM modulation ->
-        pyramid_fuse (bidirectional cross-attention) -> se_block -> head.
+        pyramid_fuse (bidirectional cross-attention) -> se_block ->
+        [optional AU concat] -> head.
         Factored out so rise_fall_mode="decision_level" can call this
         TWICE (once per phase, same weights both times) without duplicating
         the logic -- this IS what makes decision_level mode a faithful
         match to GAMDSS's real BDRT (one shared backbone/head, called
         independently per phase, see class docstring).
 
-        Returns: out [B, num_classes], y_feat [B, 512], attn_all
+        au_embed: [B, au_embed_dim] or None. When not None, the SAME
+        au_embed is concatenated on every call -- AU annotation is a
+        whole-clip property, so decision_level mode's two calls (rise
+        pass, fall pass) both get the identical au_embed, not a
+        phase-specific one.
+
+        Returns: out [B, num_classes], y_feat [B, 512 (+au_embed_dim)], attn_all
         """
         if self.use_spatial_film:
             x_motion = self.landmark_fusion(x_motion, x_lmk_map)    # [B, 512, 7, 7], spatial gamma/beta
@@ -305,11 +351,15 @@ class MA3D(nn.Module):
         y_hat, attn_all = self.pyramid_fuse(x_motion, x_appear)
         y_hat = self.se_block(y_hat)
 
+        if au_embed is not None:
+            y_hat = torch.cat([y_hat, au_embed], dim=-1)  # [B, 512+au_embed_dim]
+
         y_feat = y_hat
         out = self.head(y_hat)
         return out, y_feat, attn_all
 
-    def forward(self, x_apex, x_onset, x_flow_rise, x_flow_fall=None, x_offset=None):
+    def forward(self, x_apex, x_onset, x_flow_rise, x_flow_fall=None, x_offset=None,
+                x_au=None):
         """
         x_apex      : [B, 3, 224, 224] RGB apex frame  -> landmark/modulator branch,
                       also used as rise-phase diff source when motion_backbone="rmt"
@@ -328,6 +378,9 @@ class MA3D(nn.Module):
                       motion_backbone="rmt" AND self.use_rise_fall=True
                       (to compute the fall-phase whole-face diff,
                       x_offset - x_apex) -- unused/ignored otherwise.
+        x_au        : [B, au_dim] multi-hot AU vector (see au_utils.py).
+                      REQUIRED when self.use_au=True; ignored/unused when
+                      self.use_au=False (still fine to pass None then).
 
         Returns: out, y_feat, attn_all, aux
             aux = {
@@ -356,6 +409,17 @@ class MA3D(nn.Module):
 
         aux = {"rise": None, "fall": None, "agreement": None}
 
+        # --- Optional AU-guidance branch: computed ONCE (AU annotation is
+        # a whole-clip property, not rise- or fall-specific), reused by
+        # every _film_and_classify() call below regardless of
+        # use_rise_fall/rise_fall_mode. ---
+        au_embed = None
+        if self.use_au:
+            assert x_au is not None, (
+                "self.use_au=True requires x_au [B, au_dim] to be passed to forward()"
+            )
+            au_embed = self.au_encoder(x_au)                        # [B, au_embed_dim]
+
         # --- Motion branch input: either the ROI-cropped flow map (cnn) or
         # a whole-face RGB diff computed on the fly (rmt) -- see class
         # docstring on motion_backbone.
@@ -369,7 +433,8 @@ class MA3D(nn.Module):
         if not self.use_rise_fall:
             # Original single-phase (rise-only) behaviour, unchanged.
             x_motion = self.motion_encoder(motion_input_rise)        # [B, 512, 7, 7]
-            out, y_feat, attn_all = self._film_and_classify(x_motion, x_lmk_map, x_appear, B)
+            out, y_feat, attn_all = self._film_and_classify(
+                x_motion, x_lmk_map, x_appear, B, au_embed=au_embed)
             return out, y_feat, attn_all, aux
 
         assert motion_input_fall is not None, (
@@ -389,7 +454,8 @@ class MA3D(nn.Module):
             aux["fall"] = self.aux_head_fall(x_motion_fall.mean(dim=[2, 3]))
 
             x_motion, aux["agreement"] = self.rise_fall_fusion(x_motion_rise, x_motion_fall)
-            out, y_feat, attn_all = self._film_and_classify(x_motion, x_lmk_map, x_appear, B)
+            out, y_feat, attn_all = self._film_and_classify(
+                x_motion, x_lmk_map, x_appear, B, au_embed=au_embed)
             return out, y_feat, attn_all, aux
 
         else:  # rise_fall_mode == "decision_level"
@@ -399,9 +465,9 @@ class MA3D(nn.Module):
             # fall -- verified against the actual GAMDSS training script,
             # not just model.py/RMT.py: `ALL, s = net(...)`.
             out_rise, feat_rise, attn_rise = self._film_and_classify(
-                x_motion_rise, x_lmk_map, x_appear, B)
+                x_motion_rise, x_lmk_map, x_appear, B, au_embed=au_embed)
             out_fall, feat_fall, attn_fall = self._film_and_classify(
-                x_motion_fall, x_lmk_map, x_appear, B)
+                x_motion_fall, x_lmk_map, x_appear, B, au_embed=au_embed)
 
             # IMPORTANT (corrected after seeing GAMDSS's real training
             # loop): the two outputs are NOT averaged. GAMDSS's script

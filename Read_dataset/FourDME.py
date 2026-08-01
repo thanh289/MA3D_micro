@@ -68,7 +68,7 @@ class FourDME_Dataset(Dataset):
 
     def __init__(self, root_dir, transform=None, flow_key="flow_map",
                  flow_fall_key="flow_map_fall", use_rise_fall=True,
-                 load_offset=False, file_suffix="", verbose=False):
+                 load_offset=False, load_au=False, file_suffix="", verbose=False):
         """
         flow_key: "flow_map" (spatial map, matches MotionEncoderCNN -- the
             path used by the current architecture) or "flow" (pooled
@@ -89,6 +89,15 @@ class FourDME_Dataset(Dataset):
             interface exactly) -- flow_map_fall.npy already covers the
             "fall phase" motion signal for motion_backbone="cnn", so most
             use_rise_fall=True runs do NOT need load_offset=True too.
+        load_au: if True, every sample must ALSO have au.npy on disk
+            (skipped otherwise, counted in `skipped`) -- a fixed-length
+            [40] float32 multi-hot AU vector (20 dynamic + 20 static AUs,
+            see au_utils.py) produced by the preprocessing notebook via
+            au_utils.save_au_vector(), feeding MA3D.py's optional
+            AU-guidance branch (use_au=True). au.npy has NO file_suffix
+            variant (it's a ground-truth annotation, not GAMDSS-corrected
+            frame data) -- the same file is used regardless of
+            file_suffix.
         file_suffix: "" reads the base files (inputs.png, onset.png,
             flow_map.npy, flow_map_fall.npy, offset.png). "_gamdss" (or
             any other suffix produced by run_inference_flow.py --suffix)
@@ -109,6 +118,7 @@ class FourDME_Dataset(Dataset):
         self.flow_fall_key = flow_fall_key
         self.use_rise_fall = use_rise_fall
         self.load_offset = load_offset
+        self.load_au = load_au
         self.file_suffix = file_suffix
 
         if not os.path.exists(root_dir):
@@ -131,6 +141,7 @@ class FourDME_Dataset(Dataset):
             base_offset_path = os.path.join(path, "offset.png")
             base_flow_path   = os.path.join(path, f"{flow_key}.npy")
             base_fall_path   = os.path.join(path, f"{flow_fall_key}.npy")
+            base_au_path     = os.path.join(path, "au.npy")
             label_path       = os.path.join(path, "label.npy")
 
             required_ok = (os.path.exists(base_apex_path) and os.path.exists(base_onset_path)
@@ -139,6 +150,8 @@ class FourDME_Dataset(Dataset):
                 required_ok = required_ok and os.path.exists(base_fall_path)
             if load_offset:
                 required_ok = required_ok and os.path.exists(base_offset_path)
+            if load_au:
+                required_ok = required_ok and os.path.exists(base_au_path)
 
             if not required_ok:
                 skipped += 1
@@ -165,6 +178,10 @@ class FourDME_Dataset(Dataset):
                 flow_fall_path = base_fall_path if use_rise_fall else None
                 offset_path = base_offset_path if load_offset else None
 
+            # au.npy has no file_suffix variant (ground-truth annotation,
+            # not GAMDSS-corrected frame data) -- always the base path.
+            au_path = base_au_path if load_au else None
+
             sub_id = folder.split("_vid")[0]
 
             self.samples.append({
@@ -174,6 +191,7 @@ class FourDME_Dataset(Dataset):
                 "offset_path":    offset_path,
                 "flow_path":      flow_path,
                 "flow_fall_path": flow_fall_path,
+                "au_path":        au_path,
                 "label_path":     label_path,
             })
             self.subjects.append(sub_id)
@@ -182,6 +200,7 @@ class FourDME_Dataset(Dataset):
             print(f"[4DME] samples={len(self.samples)} | skipped={skipped} | "
                   f"unique subjects={len(set(self.subjects))} | "
                   f"use_rise_fall={use_rise_fall} | load_offset={load_offset} | "
+                  f"load_au={load_au} | "
                   f"file_suffix={file_suffix!r} | fallback_to_base={fallback_counter[0]}")
             labels = [int(np.load(s["label_path"])) for s in self.samples]
             for idx, name in IDX2EMOTION.items():
@@ -212,6 +231,7 @@ class FourDME_Dataset(Dataset):
 
         flow_rise_np = np.load(s["flow_path"])
         flow_fall_np = np.load(s["flow_fall_path"]) if s["flow_fall_path"] is not None else None
+        au_np = np.load(s["au_path"]) if s["au_path"] is not None else None
         label = int(np.load(s["label_path"]))
 
         if getattr(self.transform, "train", False) and random.random() < 0.5:
@@ -229,6 +249,8 @@ class FourDME_Dataset(Dataset):
         }
         if flow_fall_np is not None:
             item["flow_fall"] = torch.from_numpy(flow_fall_np).float()
+        if au_np is not None:
+            item["au"] = torch.from_numpy(au_np).float()
         if offset_t is not None:
             item["offset"] = offset_t
 
