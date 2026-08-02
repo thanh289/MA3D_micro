@@ -1,4 +1,4 @@
-from FourDME import FourDME_Dataset, EMOTION2IDX, IDX2EMOTION  # noqa: F401  (re-exported for convenience)
+from Read_dataset.FourDME import FourDME_Dataset, EMOTION2IDX, IDX2EMOTION  # noqa: F401  (re-exported for convenience)
 
 
 class CASME2_Dataset(FourDME_Dataset):
