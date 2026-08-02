@@ -39,12 +39,8 @@ def get_args():
     # Dataset
     parser.add_argument("--data_type", default="RAF-DB",
                         choices=["RAF-DB", "VKIST", "Cheo", "FerPlus", "Caers",
-                                 "CheoFaMo", "4DME_MOTION"])
-    parser.add_argument("--num_classes", type=int, default=7,
-                        help="Default 7 is for the MaE datasets (RAF-DB etc). "
-                             "4DME_MOTION uses the 5-class scheme (Positive, "
-                             "Negative, Surprise, Repression, Others) -- pass "
-                             "--num_classes 5 explicitly when using it.")
+                                 "CheoFaMo", "4DME_MOTION", "CASME2_MOTION"])
+    parser.add_argument("--num_classes", type=int, default=7)
     parser.add_argument("--class_names", type=str, default=None,
                         help="Comma-separated class names in label-index order, "
                              "e.g. 'Negative,Positive,Surprise,Repression,Others'. "
@@ -94,9 +90,10 @@ def get_args():
     parser.add_argument("--motion_backbone", type=str, default="cnn",
                         choices=["cnn", "rmt"])
     parser.add_argument("--use_au", action="store_true")
+    parser.add_argument("--au_dim", type=int, default=36)
     parser.add_argument("--au_embed_dim", type=int, default=128)
     parser.add_argument("--use_gamdss", action="store_true",
-                        help="4DME_MOTION only: TRAIN view reads the GAMDSS "
+                        help="4DME_MOTION/CASME2_MOTION only: TRAIN view reads the GAMDSS "
                              "dynamic-frame-reselection-corrected files "
                              "(inputs_gamdss.png, onset_gamdss.png, "
                              "flow_map_gamdss.npy, flow_map_fall_gamdss.npy). "
@@ -263,6 +260,7 @@ def run_fold(args, train_loader, val_loader, device, fold_tag=None):
                   rise_fall_mode=args.rise_fall_mode,
                   motion_backbone=args.motion_backbone,
                   use_au=args.use_au,
+                  au_dim=args.au_dim,
                   au_embed_dim=args.au_embed_dim).to(device)
 
     if use_wandb and args.wandb_watch_model:
@@ -450,10 +448,17 @@ def main():
     os.makedirs(args.resume_dir, exist_ok=True)
     os.makedirs(args.backup_dir, exist_ok=True)
 
-    if args.data_type == "4DME_MOTION":
+    if args.data_type in ("4DME_MOTION", "CASME2_MOTION"):
         if args.num_classes != 5:
-            print(f"[WARN] data_type=4DME_MOTION but num_classes={args.num_classes} "
+            print(f"[WARN] data_type={args.data_type} but num_classes={args.num_classes} "
                   f"(expected 5: Negative, Positive, Surprise, Repression, Others)")
+
+        if args.use_au:
+            expected_au_dim = 36 if args.data_type == "4DME_MOTION" else 19
+            if args.au_dim != expected_au_dim:
+                print(f"[WARN] data_type={args.data_type} with --use_au but "
+                      f"au_dim={args.au_dim} (expected {expected_au_dim}) -- "
+                      f"the au.npy files on disk won't match this shape.")
 
         splits = get_loso_dataloaders(args)
         print(f"[LOSO] {len(splits)} subject folds queued")

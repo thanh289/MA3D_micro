@@ -182,7 +182,7 @@ class FourDME_Dataset(Dataset):
             # not GAMDSS-corrected frame data) -- always the base path.
             au_path = base_au_path if load_au else None
 
-            sub_id = folder.split("_vid")[0]
+            sub_id = self._parse_subject_id(folder)
 
             self.samples.append({
                 "folder":         path,
@@ -205,6 +205,9 @@ class FourDME_Dataset(Dataset):
             labels = [int(np.load(s["label_path"])) for s in self.samples]
             for idx, name in IDX2EMOTION.items():
                 print(f"  {name}: {labels.count(idx)}")
+
+    def _parse_subject_id(self, folder_name):
+        return folder_name.split("_vid")[0]
 
     def __len__(self):
         return len(self.samples)

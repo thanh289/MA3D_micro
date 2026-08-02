@@ -4,6 +4,7 @@ from torch.utils.data import DataLoader, Subset
 from torchvision import transforms
 from Read_dataset import *
 from Read_dataset.FourDME import FourDME_Dataset
+from Read_dataset.CasmeII import CASME2_Dataset
 from paired_transform import PairedFaceTransform
 from torch.utils.data import WeightedRandomSampler
 from collections import Counter
@@ -85,10 +86,10 @@ def get_dataloaders(args):
         CheoFamo_root = os.path.join(data_dir, "CheoFamo")
         train_dataset = CheoFaMo(CheoFamo_root, split="train", transform=train_transform)
         val_dataset = CheoFaMo(CheoFamo_root, split="test", transform=val_transform)
-    elif args.data_type == "4DME_MOTION":
+    elif args.data_type in ("4DME_MOTION", "CASME2_MOTION"):
         raise ValueError(
-            "4DME_MOTION uses LOSO (subject-independent) evaluation -- call "
-            "get_loso_dataloaders(args) instead of get_dataloaders(args), "
+            f"{args.data_type} uses LOSO (subject-independent) evaluation -- "
+            "call get_loso_dataloaders(args) instead of get_dataloaders(args), "
             "since it returns a list of per-fold (train_loader, val_loader, "
             "held_out_subject) tuples rather than a single pair."
         )
@@ -119,9 +120,21 @@ def get_dataloaders(args):
     return train_loader, val_loader
 
 
+# Which Dataset class + preprocessed-folder name to use per data_type --
+# both datasets share IDENTICAL on-disk sample layout (see CASME2.py's
+# docstring), so the ONLY things that vary are the class (for subject-id
+# parsing) and the folder produced by that dataset's
+# run_inference_flow*.py. Add new LOSO-style ME datasets here.
+_LOSO_DATASET_REGISTRY = {
+    "4DME_MOTION":   (FourDME_Dataset, "4dme_ma3d_motion"),
+    "CASME2_MOTION": (CASME2_Dataset,  "casme2_ma3d_motion"),
+}
+
+
 def get_loso_dataloaders(args):
     """
-    Builds true leave-one-subject-out splits for the 4DME_MOTION dataset:
+    Builds true leave-one-subject-out splits for LOSO-style ME datasets
+    (currently 4DME_MOTION, CASME2_MOTION -- see _LOSO_DATASET_REGISTRY):
     one fold per unique subject, that subject's samples held out as the
     validation set, everyone else's samples used for training.
 
@@ -132,19 +145,26 @@ def get_loso_dataloaders(args):
     CausalNet, HTNet, etc. all report averaged metrics over subject folds,
     not one shared train/val split).
 
-    Two FourDME_Dataset instances are built over the SAME root directory,
-    one with the train transform (augmented) and one with the val
-    transform (no augmentation) -- Subset() then indexes into whichever one
-    is appropriate for train vs. val. Both instances list samples via the
+    Two dataset instances are built over the SAME root directory, one
+    with the train transform (augmented) and one with the val transform
+    (no augmentation) -- Subset() then indexes into whichever one is
+    appropriate for train vs. val. Both instances list samples via the
     same sorted(os.listdir(...)) order, so indices line up 1:1 between them.
     """
     from sklearn.model_selection import LeaveOneGroupOut
 
+    if args.data_type not in _LOSO_DATASET_REGISTRY:
+        raise ValueError(
+            f"get_loso_dataloaders() doesn't know data_type={args.data_type!r} "
+            f"-- expected one of {list(_LOSO_DATASET_REGISTRY)}"
+        )
+    dataset_cls, folder_name = _LOSO_DATASET_REGISTRY[args.data_type]
+
     project_root = os.path.dirname(os.path.abspath(__file__))
     data_dir = os.path.join(project_root, "Datasets")
-    root = os.path.join(data_dir, "4dme_ma3d_motion")  # single merged folder,
-                                                          # produced by the
-                                                          # updated run_inference_flow.py
+    root = os.path.join(data_dir, folder_name)  # single merged folder,
+                                                   # produced by that
+                                                   # dataset's run_inference_flow*.py
 
     train_tf = PairedFaceTransform(img_size=224, train=True)
     val_tf   = PairedFaceTransform(img_size=224, train=False)
@@ -170,19 +190,19 @@ def get_loso_dataloaders(args):
     # val time too, to actually exercise every branch; only file_suffix
     # (gamdss vs. original) differs between train/val, not which files
     # get loaded.
-    dataset_train_view = FourDME_Dataset(root, transform=train_tf, flow_key="flow_map",
-                                          flow_fall_key="flow_map_fall",
-                                          use_rise_fall=use_rise_fall,
-                                          load_offset=load_offset,
-                                          load_au=load_au,
-                                          file_suffix="_gamdss" if use_gamdss else "",
-                                          verbose=True)
-    dataset_val_view   = FourDME_Dataset(root, transform=val_tf,   flow_key="flow_map",
-                                          flow_fall_key="flow_map_fall",
-                                          use_rise_fall=use_rise_fall,
-                                          load_offset=load_offset,
-                                          load_au=load_au,
-                                          file_suffix="")
+    dataset_train_view = dataset_cls(root, transform=train_tf, flow_key="flow_map",
+                                      flow_fall_key="flow_map_fall",
+                                      use_rise_fall=use_rise_fall,
+                                      load_offset=load_offset,
+                                      load_au=load_au,
+                                      file_suffix="_gamdss" if use_gamdss else "",
+                                      verbose=True)
+    dataset_val_view   = dataset_cls(root, transform=val_tf,   flow_key="flow_map",
+                                      flow_fall_key="flow_map_fall",
+                                      use_rise_fall=use_rise_fall,
+                                      load_offset=load_offset,
+                                      load_au=load_au,
+                                      file_suffix="")
 
     subjects = np.array(dataset_train_view.subjects)
     n_subjects = len(set(subjects.tolist()))
