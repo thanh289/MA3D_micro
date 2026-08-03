@@ -1,4 +1,5 @@
 import os
+os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8" 
 import torch
 import torch.optim as optim
 from models.MA3D import MA3D
@@ -29,6 +30,7 @@ def set_seed(seed: int):
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+    torch.use_deterministic_algorithms(True, warn_only=True)
 
 
 def get_args():
