@@ -262,7 +262,8 @@ class MA3D(nn.Module):
         # -- this IS the "share-weight" design agreed in chat, not two
         # separate encoders.
         if motion_backbone == "cnn":
-            self.motion_encoder = MotionEncoderCNN(n_roi=n_roi, out_channels=512)
+            self.motion_encoder = MotionEncoderCNN(n_roi=n_roi, out_channels=512,
+                                        deterministic_pool=True)
         else:  # "rmt"
             self.motion_encoder = RMTMotionEncoder()
 

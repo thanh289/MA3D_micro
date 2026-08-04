@@ -3,6 +3,41 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+class DeterministicAdaptiveAvgPool2d(nn.Module):
+    """
+    Drop-in replacement for nn.AdaptiveAvgPool2d, deterministic on CUDA.
+
+    adaptive_avg_pool2d's CUDA backward has NO deterministic implementation
+    in PyTorch whenever the input/output spatial ratio isn't evenly
+    divisible (see the UserWarning torch.use_deterministic_algorithms(True,
+    warn_only=True) raises for it) -- true for BOTH poolings in this file
+    (14->3 and (3, 3*n_roi)->(7,7), neither divides evenly). CPU's backward
+    for this op IS deterministic, and the tensors going through this layer
+    are tiny (64 channels, <=14x14) by this point in the network, so
+    round-tripping to CPU just for this op is negligible overhead compared
+    to the rest of a training step -- much cheaper than the alternative of
+    reworking the pooling into a fixed-kernel op that would change its
+    numeric behavior (uneven windows can't be expressed as a single
+    fixed-stride nn.AvgPool2d).
+
+    Set `enabled=False` (or leave the module's `.enabled` off) to skip the
+    CPU round-trip and fall back to plain GPU adaptive pooling when you
+    don't need bit-exact reproducibility (e.g. normal training runs where
+    a little non-determinism from this one op is an acceptable tradeoff
+    for not paying the CPU<->GPU sync cost every forward/backward).
+    """
+
+    def __init__(self, output_size, enabled=True):
+        super().__init__()
+        self.output_size = output_size
+        self.enabled = enabled
+
+    def forward(self, x):
+        if self.enabled and x.device.type == "cuda":
+            return F.adaptive_avg_pool2d(x.cpu(), self.output_size).to(x.device)
+        return F.adaptive_avg_pool2d(x, self.output_size)
+
+
 class MotionEncoderCNN(nn.Module):
     """
     Motion branch encoder -- the main "content" branch in the new
@@ -35,7 +70,18 @@ class MotionEncoderCNN(nn.Module):
     Output: [B, out_channels, 7, 7]
     """
 
-    def __init__(self, n_roi=3, out_channels=512, roi_pool_size=3, dropout=0.2):
+    def __init__(self, n_roi=3, out_channels=512, roi_pool_size=3, dropout=0.2,
+                 deterministic_pool=False):
+        """
+        deterministic_pool: if True, both AdaptiveAvgPool2d layers below
+        round-trip through CPU for their backward pass (see
+        DeterministicAdaptiveAvgPool2d's docstring) -- use this when you
+        need bit-exact reproducibility across runs (paired with
+        torch.use_deterministic_algorithms(True) in train.py). Leave False
+        (default) for normal training, where the small non-determinism
+        from these 2 ops is an acceptable tradeoff for not paying the
+        CPU<->GPU sync cost on every forward/backward.
+        """
         super().__init__()
         self.n_roi = n_roi
         self.roi_pool_size = roi_pool_size
@@ -52,7 +98,8 @@ class MotionEncoderCNN(nn.Module):
             nn.Conv2d(32, 64, kernel_size=3, padding=1),
             nn.BatchNorm2d(64),
             nn.ReLU(True),
-            nn.AdaptiveAvgPool2d((roi_pool_size, roi_pool_size)),  # NOT (1,1) -- keep spatial
+            DeterministicAdaptiveAvgPool2d((roi_pool_size, roi_pool_size),
+                                            enabled=deterministic_pool),  # NOT (1,1) -- keep spatial
             nn.Dropout2d(dropout),
         )
 
@@ -60,7 +107,7 @@ class MotionEncoderCNN(nn.Module):
             nn.Conv2d(64, out_channels, kernel_size=1),
             nn.BatchNorm2d(out_channels),
             nn.ReLU(True),
-            nn.AdaptiveAvgPool2d((7, 7)),  # force exactly 7x7, independent of n_roi/roi_pool_size
+            DeterministicAdaptiveAvgPool2d((7, 7), enabled=deterministic_pool),  # force exactly 7x7, independent of n_roi/roi_pool_size
         )
 
     def forward(self, x_roi):
