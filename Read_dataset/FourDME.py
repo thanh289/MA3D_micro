@@ -66,6 +66,9 @@ class FourDME_Dataset(Dataset):
     sklearn.model_selection.LeaveOneGroupOut.
     """
 
+    EMOTION2IDX = EMOTION2IDX
+    IDX2EMOTION = IDX2EMOTION
+
     def __init__(self, root_dir, transform=None, flow_key="flow_map",
                  flow_fall_key="flow_map_fall", use_rise_fall=True,
                  load_offset=False, load_au=False, file_suffix="", verbose=False):
@@ -203,7 +206,7 @@ class FourDME_Dataset(Dataset):
                   f"load_au={load_au} | "
                   f"file_suffix={file_suffix!r} | fallback_to_base={fallback_counter[0]}")
             labels = [int(np.load(s["label_path"])) for s in self.samples]
-            for idx, name in IDX2EMOTION.items():
+            for idx, name in self.IDX2EMOTION.items():
                 print(f"  {name}: {labels.count(idx)}")
 
     def _parse_subject_id(self, folder_name):

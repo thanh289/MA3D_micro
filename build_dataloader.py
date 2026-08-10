@@ -5,6 +5,7 @@ from torchvision import transforms
 from Read_dataset import *
 from Read_dataset.FourDME import FourDME_Dataset
 from Read_dataset.CasmeII import CASME2_Dataset
+from Read_dataset.SmicHS import SmicHS_Dataset
 from paired_transform import PairedFaceTransform
 from torch.utils.data import WeightedRandomSampler
 from collections import Counter
@@ -86,7 +87,7 @@ def get_dataloaders(args):
         CheoFamo_root = os.path.join(data_dir, "CheoFamo")
         train_dataset = CheoFaMo(CheoFamo_root, split="train", transform=train_transform)
         val_dataset = CheoFaMo(CheoFamo_root, split="test", transform=val_transform)
-    elif args.data_type in ("4DME_MOTION", "CASME2_MOTION"):
+    elif args.data_type in ("4DME_MOTION", "CASME2_MOTION", "SMIC_HS_MOTION"):
         raise ValueError(
             f"{args.data_type} uses LOSO (subject-independent) evaluation -- "
             "call get_loso_dataloaders(args) instead of get_dataloaders(args), "
@@ -121,22 +122,25 @@ def get_dataloaders(args):
 
 
 # Which Dataset class + preprocessed-folder name to use per data_type --
-# both datasets share IDENTICAL on-disk sample layout (see CASME2.py's
-# docstring), so the ONLY things that vary are the class (for subject-id
-# parsing) and the folder produced by that dataset's
-# run_inference_flow*.py. Add new LOSO-style ME datasets here.
+# all 3 datasets share IDENTICAL on-disk sample layout (see CASME2.py's /
+# SmicHS.py's docstrings), so the ONLY things that vary are the class (for
+# subject-id parsing + label table) and the folder produced by that
+# dataset's run_inference_flow*.py. Add new LOSO-style ME datasets here.
+#
 _LOSO_DATASET_REGISTRY = {
-    "4DME_MOTION":   (FourDME_Dataset, "4dme_ma3d_motion"),
-    "CASME2_MOTION": (CASME2_Dataset,  "casme2_ma3d_motion"),
+    "4DME_MOTION":    (FourDME_Dataset, "4dme_ma3d_motion"),
+    "CASME2_MOTION":  (CASME2_Dataset,  "casme2_ma3d_motion"),
+    "SMIC_HS_MOTION": (SmicHS_Dataset,  "smichs_ma3d_motion"),
 }
 
 
 def get_loso_dataloaders(args):
     """
     Builds true leave-one-subject-out splits for LOSO-style ME datasets
-    (currently 4DME_MOTION, CASME2_MOTION -- see _LOSO_DATASET_REGISTRY):
-    one fold per unique subject, that subject's samples held out as the
-    validation set, everyone else's samples used for training.
+    (currently 4DME_MOTION, CASME2_MOTION, SMIC_HS_MOTION -- see
+    _LOSO_DATASET_REGISTRY): one fold per unique subject, that subject's
+    samples held out as the validation set, everyone else's samples used
+    for training.
 
     Returns a list of (train_loader, val_loader, held_out_subject) tuples.
     train.py is expected to loop over this list, train ONE model per fold

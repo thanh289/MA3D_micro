@@ -41,7 +41,8 @@ def get_args():
     # Dataset
     parser.add_argument("--data_type", default="RAF-DB",
                         choices=["RAF-DB", "VKIST", "Cheo", "FerPlus", "Caers",
-                                 "CheoFaMo", "4DME_MOTION", "CASME2_MOTION"])
+                                 "CheoFaMo", "4DME_MOTION", "CASME2_MOTION",
+                                 "SMIC_HS_MOTION"])
     parser.add_argument("--num_classes", type=int, default=7)
     parser.add_argument("--class_names", type=str, default=None,
                         help="Comma-separated class names in label-index order, "
@@ -108,7 +109,8 @@ def get_args():
                         help="Use a class-balanced WeightedRandomSampler for "
                              "training instead of plain shuffling.")
     parser.add_argument("--loso_debug_subject", type=str, default=None,
-                        help="4DME_MOTION only: restrict the LOSO loop to a "
+                        help="LOSO ME datasets only (4DME_MOTION/CASME2_MOTION/"
+                             "SMIC_HS_MOTION): restrict the LOSO loop to a "
                              "single held-out subject, for quick smoke-testing "
                              "of the pipeline without running all folds.")
     parser.add_argument("--early_stop_on_perfect_val", action="store_true",
@@ -450,17 +452,25 @@ def main():
     os.makedirs(args.resume_dir, exist_ok=True)
     os.makedirs(args.backup_dir, exist_ok=True)
 
-    if args.data_type in ("4DME_MOTION", "CASME2_MOTION"):
-        if args.num_classes != 5:
+    if args.data_type in ("4DME_MOTION", "CASME2_MOTION", "SMIC_HS_MOTION"):
+        _expected_num_classes = {
+            "4DME_MOTION": 5, "CASME2_MOTION": 5, "SMIC_HS_MOTION": 3,
+        }[args.data_type]
+        if args.num_classes != _expected_num_classes:
             print(f"[WARN] data_type={args.data_type} but num_classes={args.num_classes} "
-                  f"(expected 5: Negative, Positive, Surprise, Repression, Others)")
+                  f"(expected {_expected_num_classes})")
 
         if args.use_au:
-            expected_au_dim = 36 if args.data_type == "4DME_MOTION" else 19
-            if args.au_dim != expected_au_dim:
-                print(f"[WARN] data_type={args.data_type} with --use_au but "
-                      f"au_dim={args.au_dim} (expected {expected_au_dim}) -- "
-                      f"the au.npy files on disk won't match this shape.")
+            if args.data_type == "SMIC_HS_MOTION":
+                print(f"[WARN] SMIC_HS_MOTION has no AU annotations (no au.npy on disk) "
+                      f"-- --use_au will make every sample fail FourDME_Dataset's "
+                      f"required-file check, so the dataset will end up empty.")
+            else:
+                expected_au_dim = 36 if args.data_type == "4DME_MOTION" else 19
+                if args.au_dim != expected_au_dim:
+                    print(f"[WARN] data_type={args.data_type} with --use_au but "
+                          f"au_dim={args.au_dim} (expected {expected_au_dim}) -- "
+                          f"the au.npy files on disk won't match this shape.")
 
         splits = get_loso_dataloaders(args)
         print(f"[LOSO] {len(splits)} subject folds queued")
