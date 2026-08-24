@@ -1,4 +1,4 @@
-"""Utilities for source-train/validation cross-dataset ME evaluation.
+"""Utilities for full-source cross-dataset ME evaluation.
 
 This module intentionally does not touch the legacy ``eval.py`` path, which
 belongs to the macro-expression version of the repository.  It builds on the
@@ -23,8 +23,7 @@ from sklearn.metrics import (
     f1_score,
     recall_score,
 )
-from sklearn.model_selection import GroupShuffleSplit
-from torch.utils.data import DataLoader, Dataset, Subset, WeightedRandomSampler
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 
 from Read_dataset.CasmeII import CASME2_Dataset
 from Read_dataset.FourDME import FourDME_Dataset
@@ -304,68 +303,6 @@ def _labels_from_view(view: CrossDatasetView) -> np.ndarray:
     )
 
 
-def subject_group_split(
-    subjects: Sequence[str],
-    labels: Sequence[int],
-    *,
-    val_fraction: float,
-    seed: int,
-    explicit_val_subjects: Optional[Sequence[str]] = None,
-    require_all_classes: bool = True,
-    max_attempts: int = 500,
-) -> Tuple[np.ndarray, np.ndarray, List[str]]:
-    subjects_arr = np.asarray([str(x) for x in subjects])
-    labels_arr = np.asarray(labels, dtype=np.int64)
-    unique_subjects = sorted(set(subjects_arr.tolist()))
-    if len(unique_subjects) < 2:
-        raise ValueError("A source train/validation split needs at least two subjects")
-
-    if explicit_val_subjects:
-        val_subjects = sorted(set(str(x) for x in explicit_val_subjects))
-        missing = sorted(set(val_subjects) - set(unique_subjects))
-        if missing:
-            raise ValueError(
-                f"Unknown --val_subjects {missing}; available subjects: {unique_subjects}"
-            )
-        val_mask = np.isin(subjects_arr, val_subjects)
-        train_idx = np.flatnonzero(~val_mask)
-        val_idx = np.flatnonzero(val_mask)
-        candidates = [(train_idx, val_idx)]
-    else:
-        if not 0.0 < val_fraction < 1.0:
-            raise ValueError("--val_fraction must be between 0 and 1")
-        candidates = []
-        dummy = np.zeros(len(subjects_arr), dtype=np.float32)
-        for attempt in range(max_attempts):
-            splitter = GroupShuffleSplit(
-                n_splits=1,
-                test_size=val_fraction,
-                random_state=seed + attempt,
-            )
-            candidates.append(next(splitter.split(dummy, labels_arr, groups=subjects_arr)))
-
-    for train_idx, val_idx in candidates:
-        if len(train_idx) == 0 or len(val_idx) == 0:
-            continue
-        if require_all_classes:
-            if set(labels_arr[train_idx].tolist()) != set(LABELS):
-                continue
-            if set(labels_arr[val_idx].tolist()) != set(LABELS):
-                continue
-        val_subjects = sorted(set(subjects_arr[val_idx].tolist()))
-        return np.asarray(train_idx), np.asarray(val_idx), val_subjects
-
-    coverage = {
-        subject: sorted(set(labels_arr[subjects_arr == subject].tolist()))
-        for subject in unique_subjects
-    }
-    raise ValueError(
-        "Could not construct a subject-disjoint source split with the required "
-        f"class coverage after {len(candidates)} attempt(s). Subject coverage: {coverage}. "
-        "Use --allow_missing_val_classes or provide --val_subjects explicitly."
-    )
-
-
 def _seed_worker(worker_id: int) -> None:
     worker_seed = torch.initial_seed() % (2**32)
     np.random.seed(worker_seed)
@@ -375,11 +312,11 @@ def _seed_worker(worker_id: int) -> None:
 
 
 def _make_train_sampler(
-    labels: np.ndarray, train_idx: np.ndarray, generator: torch.Generator
+    labels: np.ndarray, generator: torch.Generator
 ) -> WeightedRandomSampler:
-    split_labels = labels[train_idx].tolist()
-    class_counts = Counter(split_labels)
-    weights = [1.0 / class_counts[label] for label in split_labels]
+    all_labels = labels.tolist()
+    class_counts = Counter(all_labels)
+    weights = [1.0 / class_counts[label] for label in all_labels]
     return WeightedRandomSampler(
         weights,
         num_samples=len(weights),
@@ -388,16 +325,13 @@ def _make_train_sampler(
     )
 
 
-def build_source_loaders(
+def build_full_source_loader(
     dataset_key: str,
     root: str,
     *,
     batch_size: int,
     num_workers: int,
     seed: int,
-    val_fraction: float,
-    val_subjects: Optional[Sequence[str]],
-    require_all_classes: bool,
     use_sampler: bool,
     n_roi: int,
     use_rise_fall: bool,
@@ -405,7 +339,7 @@ def build_source_loaders(
     use_au: bool,
     au_schema: str,
     use_gamdss: bool,
-) -> Tuple[DataLoader, DataLoader, Mapping[str, object]]:
+) -> Tuple[DataLoader, Mapping[str, object]]:
     dataset_key = normalize_dataset_key(dataset_key)
     train_view = build_dataset_view(
         dataset_key,
@@ -419,36 +353,7 @@ def build_source_loaders(
         use_gamdss=use_gamdss,
         verbose=True,
     )
-    val_view = build_dataset_view(
-        dataset_key,
-        root,
-        train=False,
-        n_roi=n_roi,
-        use_rise_fall=use_rise_fall,
-        motion_backbone=motion_backbone,
-        use_au=use_au,
-        au_schema=au_schema,
-        use_gamdss=False,
-        verbose=False,
-    )
-
-    train_ids = [os.path.basename(x["folder"]) for x in train_view.samples]
-    val_ids = [os.path.basename(x["folder"]) for x in val_view.samples]
-    if train_ids != val_ids:
-        raise RuntimeError(
-            "Source train/validation dataset views do not contain the same ordered samples"
-        )
-
     labels = _labels_from_view(train_view)
-    train_idx, val_idx, held_out_subjects = subject_group_split(
-        train_view.subjects,
-        labels,
-        val_fraction=val_fraction,
-        seed=seed,
-        explicit_val_subjects=val_subjects,
-        require_all_classes=require_all_classes,
-    )
-
     generator = torch.Generator()
     generator.manual_seed(seed)
     loader_common = dict(
@@ -458,41 +363,31 @@ def build_source_loaders(
         worker_init_fn=_seed_worker,
         generator=generator,
     )
-    train_subset = Subset(train_view, train_idx.tolist())
-    val_subset = Subset(val_view, val_idx.tolist())
-
     if use_sampler:
         train_loader = DataLoader(
-            train_subset,
-            sampler=_make_train_sampler(labels, train_idx, generator),
-            drop_last=len(train_subset) >= batch_size,
+            train_view,
+            sampler=_make_train_sampler(labels, generator),
+            drop_last=len(train_view) >= batch_size,
             **loader_common,
         )
     else:
         train_loader = DataLoader(
-            train_subset,
+            train_view,
             shuffle=True,
-            drop_last=len(train_subset) >= batch_size,
+            drop_last=len(train_view) >= batch_size,
             **loader_common,
         )
-    val_loader = DataLoader(
-        val_subset,
-        shuffle=False,
-        drop_last=False,
-        **loader_common,
-    )
 
     metadata = {
+        "protocol": "full_source_training",
         "dataset": dataset_key,
         "root": os.path.abspath(os.path.expanduser(root)),
-        "train_samples": len(train_idx),
-        "val_samples": len(val_idx),
-        "train_subjects": sorted(set(np.asarray(train_view.subjects)[train_idx].tolist())),
-        "val_subjects": held_out_subjects,
-        "train_class_counts": dict(Counter(labels[train_idx].tolist())),
-        "val_class_counts": dict(Counter(labels[val_idx].tolist())),
+        "train_samples": len(train_view),
+        "train_subject_count": len(set(train_view.subjects)),
+        "train_subjects": sorted(set(train_view.subjects)),
+        "train_class_counts": dict(Counter(labels.tolist())),
     }
-    return train_loader, val_loader, metadata
+    return train_loader, metadata
 
 
 def build_target_loader(
@@ -654,6 +549,9 @@ def write_result_table(path: str, rows: Iterable[Mapping[str, object]]) -> None:
     columns = [
         "Source",
         "Target",
+        "Checkpoint",
+        "Epoch",
+        "SelectionMetric",
         "UF1",
         "UAR",
         "WAR",
@@ -661,7 +559,6 @@ def write_result_table(path: str, rows: Iterable[Mapping[str, object]]) -> None:
         "F1-Pos",
         "F1-Neg",
         "F1-Surp",
-        "BestEpoch",
         "Seed",
     ]
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
