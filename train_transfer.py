@@ -91,29 +91,6 @@ def get_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     # MA3D architecture/input signature
     parser.add_argument("--model_type", choices=["small", "base", "large"], default="small")
     parser.add_argument("--n_roi", type=int, default=6)
-    parser.add_argument(
-        "--roi_mode",
-        choices=["merged3", "split6", "custom"],
-        default=None,
-        help="Preprocessing metadata; inferred from n_roi=3/6 when omitted",
-    )
-    parser.add_argument(
-        "--motion_input",
-        choices=["flow", "pixeldiff"],
-        default="flow",
-        help="Preprocessing metadata; both variants use flow_map.npy on disk",
-    )
-    parser.add_argument(
-        "--crop_scale",
-        type=float,
-        default=None,
-        help="Optional preprocessing crop scale recorded in the checkpoint/W&B contract",
-    )
-    parser.add_argument(
-        "--normalization_tag",
-        default="global_minmax",
-        help="Preprocessing normalization label recorded for reproducibility",
-    )
     parser.add_argument("--landmark_embed_dim", type=int, default=256)
     parser.add_argument("--num_film_blocks", type=int, default=5)
     parser.add_argument("--use_rise_fall", action="store_true")
@@ -128,7 +105,6 @@ def get_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 
     # AU: common15 is the supported cross-dataset 4DME/CASME schema.
     parser.add_argument("--use_au", action="store_true")
-    parser.add_argument("--au_schema", choices=["common15", "native"], default="common15")
     parser.add_argument("--au_embed_dim", type=int, default=128)
 
     # Output/resume
@@ -250,14 +226,6 @@ def _validate_resume(checkpoint: Mapping[str, object], current: Mapping[str, obj
 
 def main(argv: Optional[Sequence[str]] = None) -> None:
     args = get_args(argv)
-    if args.roi_mode is None:
-        args.roi_mode = {3: "merged3", 6: "split6"}.get(args.n_roi, "custom")
-    expected_roi_count = {"merged3": 3, "split6": 6}.get(args.roi_mode)
-    if expected_roi_count is not None and args.n_roi != expected_roi_count:
-        raise ValueError(
-            f"--roi_mode {args.roi_mode} requires --n_roi {expected_roi_count}, "
-            f"got {args.n_roi}"
-        )
     source = normalize_dataset_key(args.source)
     if source == "smic_hs":
         raise ValueError("SMIC-HS is target-only in this protocol; choose 4dme or casme2 as source")
@@ -266,12 +234,13 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     if source in target_keys:
         raise ValueError("Source dataset must not also be listed as an unseen target")
 
+    # A cross-dataset AU run always uses the fixed common 15-AU vocabulary.
+    # There is no separate user-facing AU-schema knob to keep train commands
+    # aligned with the original train.py style (--use_au on/off).
+    au_schema = "common15"
     au_dim = 0
     if args.use_au:
-        au_dim = validate_au_protocol(source, target_keys, args.au_schema)
-    elif args.au_schema == "native":
-        # Schema is irrelevant when AU is disabled; normalize it in saved config.
-        args.au_schema = "common15"
+        au_dim = validate_au_protocol(source, target_keys, au_schema)
 
     source_root = os.path.abspath(os.path.expanduser(args.source_root))
     device = _resolve_device(args.device)
@@ -304,18 +273,14 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         "num_classes": 3,
         "class_names": CLASS_NAMES,
         "n_roi": args.n_roi,
-        "roi_mode": args.roi_mode,
-        "motion_input": args.motion_input,
-        "crop_scale": args.crop_scale,
-        "normalization_tag": args.normalization_tag,
         "use_rise_fall": args.use_rise_fall,
         "rise_fall_mode": args.rise_fall_mode,
         "motion_backbone": args.motion_backbone,
         "use_gamdss_source_train_only": args.use_gamdss,
         "use_au": args.use_au,
-        "au_schema": args.au_schema if args.use_au else None,
+        "au_schema": au_schema if args.use_au else None,
         "au_dim": au_dim if args.use_au else None,
-        "common_au_vocab": COMMON15_AU_VOCAB if args.use_au and args.au_schema == "common15" else None,
+        "common_au_vocab": COMMON15_AU_VOCAB if args.use_au else None,
     }
     command_config = {
         **vars(args),
@@ -336,7 +301,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         + ", ".join(f"{DATASET_SPECS[key].display_name} -> {root}" for key, root in targets)
     )
     if args.use_au:
-        print(f"AU: schema={args.au_schema}, au_dim={au_dim}")
+        print(f"AU: schema={au_schema}, au_dim={au_dim}")
     else:
         print("AU: disabled")
 
@@ -354,7 +319,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         use_rise_fall=args.use_rise_fall,
         motion_backbone=args.motion_backbone,
         use_au=args.use_au,
-        au_schema=args.au_schema,
+        au_schema=au_schema,
         use_gamdss=args.use_gamdss,
     )
     save_json(os.path.join(run_dir, "source_split.json"), split_metadata)
@@ -518,7 +483,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 use_rise_fall=args.use_rise_fall,
                 motion_backbone=args.motion_backbone,
                 use_au=args.use_au,
-                au_schema=args.au_schema,
+                au_schema=au_schema,
             )
             prediction = predict_loader(model, target_loader, ce_criterion, device)
             metrics = compute_metrics(prediction["labels"], prediction["preds"])
