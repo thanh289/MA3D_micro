@@ -2,6 +2,7 @@
 import torch
 from torch import nn
 from torch.nn import functional as F
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 
 def sample_rois(features, boxes, output_size):
@@ -45,5 +46,8 @@ class ROIContextAggregator(nn.Module):
         size = boxes[..., 2:] - boxes[..., :2]
         tokens = local + self.identity + self.position(torch.cat((center, size), dim=-1))
         normalized = self.norm(tokens)
-        exchange, _ = self.attention(normalized, normalized, normalized, need_weights=False)
+        # Avoid the nondeterministic CUDA memory-efficient attention backward.
+        # Scope backend selection to this layer; keep the model and weights unchanged.
+        with sdpa_kernel(SDPBackend.MATH):
+            exchange, _ = self.attention(normalized, normalized, normalized, need_weights=False)
         return (tokens + exchange).mean(dim=1)
