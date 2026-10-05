@@ -76,7 +76,8 @@ def train_one_epoch(model, loader, CE_criterion, lsce_criterion, MA_criterion,
     ):
         apex, onset, flow_rise, flow_fall, offset, au, labels = prepare_batch(batch, device)
 
-        logits, features, attn, aux = model(apex, onset, flow_rise, flow_fall, offset, au)
+        logits, features, attn, aux = model(apex, onset, flow_rise, flow_fall, offset, au,
+                          roi_boxes=batch["roi_boxes"].to(device, non_blocking=True))
         loss = get_loss(logits, labels, CE_criterion, lsce_criterion, MA_criterion, epoch,
                          aux=aux, aux_loss_weight=aux_loss_weight)
 
@@ -85,7 +86,8 @@ def train_one_epoch(model, loader, CE_criterion, lsce_criterion, MA_criterion,
         # optimizer.first_step(zero_grad=True)
         optimizer.step()
 
-        # logits_2, features_2, attn, aux_2 = model(apex, onset, flow_rise, flow_fall, offset, au)
+        # logits_2, features_2, attn, aux_2 = model(apex, onset, flow_rise, flow_fall, offset, au,
+        #     roi_boxes=batch["roi_boxes"].to(device, non_blocking=True))
         # loss_2 = get_loss(logits_2, labels, CE_criterion, lsce_criterion, MA_criterion, epoch,
         #                    aux=aux_2, aux_loss_weight=aux_loss_weight)
         # loss_2.backward()
@@ -125,7 +127,8 @@ def validate(model, loader, criterion, device, epoch, epochs):
     for batch in tqdm(loader, desc=f"Validation [{epoch + 1}/{epochs}]", leave=False):
         apex, onset, flow_rise, flow_fall, offset, au, labels = prepare_batch(batch, device)
 
-        logits, features, attn, aux = model(apex, onset, flow_rise, flow_fall, offset, au)
+        logits, features, attn, aux = model(apex, onset, flow_rise, flow_fall, offset, au,
+                          roi_boxes=batch["roi_boxes"].to(device, non_blocking=True))
         loss = criterion(logits, labels)
 
         running_loss += loss.item() * labels.size(0)

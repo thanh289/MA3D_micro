@@ -453,12 +453,10 @@ def main():
     os.makedirs(args.backup_dir, exist_ok=True)
 
     if args.data_type in ("4DME_MOTION", "CASME2_MOTION", "SMIC_HS_MOTION"):
-        _expected_num_classes = {
-            "4DME_MOTION": 5, "CASME2_MOTION": 5, "SMIC_HS_MOTION": 3,
-        }[args.data_type]
-        if args.num_classes != _expected_num_classes:
-            print(f"[WARN] data_type={args.data_type} but num_classes={args.num_classes} "
-                  f"(expected {_expected_num_classes})")
+        allowed_classes = {"4DME_MOTION": (3, 5), "CASME2_MOTION": (3, 5),
+                           "SMIC_HS_MOTION": (3,)}[args.data_type]
+        if args.num_classes not in allowed_classes:
+            raise ValueError(f"Unsupported class count {args.num_classes} for {args.data_type}")
 
         if args.use_au:
             if args.data_type == "SMIC_HS_MOTION":

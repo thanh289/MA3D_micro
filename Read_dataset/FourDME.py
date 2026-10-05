@@ -1,5 +1,7 @@
 import os
 import random
+import json
+from Read_dataset.motion_augmentation import flip_sample
 import numpy as np
 import torch
 from PIL import Image
@@ -53,6 +55,8 @@ class FourDME_Dataset(Dataset):
                                  (or flow_fall.npy, pooled 'pool' mode --
                                  see flow_fall_key). Only required when
                                  use_rise_fall=True.
+        roi_boxes.npy          -- [R,4] normalized xyxy, exclusive upper edges
+        motion_meta.json       -- motion type, normalization and flip mappings
         label.npy              -- scalar int64, index into EMOTION2IDX
         fold.npy                -- original 4DME fold id, kept for reference
                                  only, NOT used to decide train/test
@@ -71,7 +75,7 @@ class FourDME_Dataset(Dataset):
 
     def __init__(self, root_dir, transform=None, flow_key="flow_map",
                  flow_fall_key="flow_map_fall", use_rise_fall=True,
-                 load_offset=False, load_au=False, file_suffix="", verbose=False):
+                 load_offset=False, load_au=False, file_suffix="", verbose=False, load_fall=None):
         """
         flow_key: "flow_map" (spatial map, matches MotionEncoderCNN -- the
             path used by the current architecture) or "flow" (pooled
@@ -85,6 +89,9 @@ class FourDME_Dataset(Dataset):
             in get_loso_dataloaders(). If False, flow_fall is never read
             or required (dataset behaves exactly like the original,
             rise-only version).
+        load_fall: controls array loading independently of cohort filtering.
+            False for decision_level evaluation; None retains existing behavior.
+            For standalone rise-only inference use use_rise_fall=False.
         load_offset: if True, every sample must ALSO have offset.png on
             disk (skipped otherwise, counted in `skipped`) -- needed for
             MA3D.py's motion_backbone="rmt" path only. False by default
@@ -104,8 +111,8 @@ class FourDME_Dataset(Dataset):
         file_suffix: "" reads the base files (inputs.png, onset.png,
             flow_map.npy, flow_map_fall.npy, offset.png). "_gamdss" (or
             any other suffix produced by run_inference_flow.py --suffix)
-            prefers the suffixed variant of EACH file, falling back to the
-            base file per-sample, per-file if the suffixed one is missing.
+            selects a complete suffixed bundle, otherwise falls back to the
+            complete original bundle (including ROI boxes and metadata).
         transform: a PairedFaceTransform-like callable,
             transform(apex_pil, onset_pil, offset_pil=None) ->
             (apex_tensor, onset_tensor) or (apex_tensor, onset_tensor,
@@ -120,6 +127,7 @@ class FourDME_Dataset(Dataset):
         self.flow_key = flow_key
         self.flow_fall_key = flow_fall_key
         self.use_rise_fall = use_rise_fall
+        self.load_fall = use_rise_fall if load_fall is None else load_fall
         self.load_offset = load_offset
         self.load_au = load_au
         self.file_suffix = file_suffix
@@ -132,7 +140,19 @@ class FourDME_Dataset(Dataset):
         skipped = 0
         fallback_counter = [0]  # mutable int, shared across _resolve_with_fallback calls
 
+        cohort = None
+        suffix_cohort = None
+        manifest_path = os.path.join(root_dir, "dataset_info.json")
+        if os.path.exists(manifest_path):
+            with open(manifest_path, encoding="utf-8") as f:
+                cohort = set(json.load(f)["saved_folders"])
+        suffix_manifest = os.path.join(root_dir, f"dataset_info{file_suffix}.json")
+        if file_suffix and os.path.exists(suffix_manifest):
+            with open(suffix_manifest, encoding="utf-8") as f:
+                suffix_cohort = set(json.load(f)["saved_folders"])
         for folder in sorted(os.listdir(root_dir)):
+            if cohort is not None and folder not in cohort:
+                continue
             path = os.path.join(root_dir, folder)
             if not os.path.isdir(path):
                 continue
@@ -160,26 +180,31 @@ class FourDME_Dataset(Dataset):
                 skipped += 1
                 continue
 
-            if file_suffix:
-                apex_path  = _resolve_with_fallback(
-                    path, f"inputs{file_suffix}.png", "inputs.png", fallback_counter)
-                onset_path = _resolve_with_fallback(
-                    path, f"onset{file_suffix}.png", "onset.png", fallback_counter)
-                flow_path  = _resolve_with_fallback(
-                    path, f"{flow_key}{file_suffix}.npy", f"{flow_key}.npy", fallback_counter)
-                flow_fall_path = None
-                if use_rise_fall:
-                    flow_fall_path = _resolve_with_fallback(
-                        path, f"{flow_fall_key}{file_suffix}.npy",
-                        f"{flow_fall_key}.npy", fallback_counter)
-                offset_path = None
-                if load_offset:
-                    offset_path = _resolve_with_fallback(
-                        path, f"offset{file_suffix}.png", "offset.png", fallback_counter)
-            else:
-                apex_path, onset_path, flow_path = base_apex_path, base_onset_path, base_flow_path
-                flow_fall_path = base_fall_path if use_rise_fall else None
-                offset_path = base_offset_path if load_offset else None
+            # Frames, motion and boxes are one aligned bundle. Never mix
+            # reselected motion with original-frame geometry metadata.
+            names = ["inputs.png", "onset.png", f"{flow_key}.npy",
+                     "roi_boxes.npy", "motion_meta.json"]
+            if use_rise_fall:
+                names.append(f"{flow_fall_key}.npy")
+            if load_offset:
+                names.append("offset.png")
+            effective_suffix = file_suffix
+            if file_suffix and ((suffix_cohort is not None and folder not in suffix_cohort) or not all(os.path.exists(os.path.join(path,
+                    f"{os.path.splitext(name)[0]}{file_suffix}{os.path.splitext(name)[1]}"))
+                    for name in names)):
+                effective_suffix = ""
+                fallback_counter[0] += 1
+            def aligned_path(stem, ext):
+                return os.path.join(path, f"{stem}{effective_suffix}{ext}")
+            boxes_path = aligned_path("roi_boxes", ".npy")
+            meta_path = aligned_path("motion_meta", ".json")
+            if not os.path.exists(boxes_path) or not os.path.exists(meta_path):
+                raise RuntimeError(f"Missing ROI metadata in {path}; regenerate with updated preprocessing")
+            apex_path = aligned_path("inputs", ".png")
+            onset_path = aligned_path("onset", ".png")
+            flow_path = aligned_path(flow_key, ".npy")
+            flow_fall_path = aligned_path(flow_fall_key, ".npy") if self.load_fall else None
+            offset_path = aligned_path("offset", ".png") if load_offset else None
 
             # au.npy has no file_suffix variant (ground-truth annotation,
             # not GAMDSS-corrected frame data) -- always the base path.
@@ -189,6 +214,8 @@ class FourDME_Dataset(Dataset):
 
             self.samples.append({
                 "folder":         path,
+                "boxes_path":     boxes_path,
+                "meta_path":      meta_path,
                 "apex_path":      apex_path,
                 "onset_path":     onset_path,
                 "offset_path":    offset_path,
@@ -222,6 +249,29 @@ class FourDME_Dataset(Dataset):
         onset_img = Image.open(s["onset_path"]).convert("RGB")
         offset_img = Image.open(s["offset_path"]).convert("RGB") if s["offset_path"] is not None else None
 
+        flow_rise_np = np.load(s["flow_path"])
+        flow_fall_np = np.load(s["flow_fall_path"]) if s["flow_fall_path"] is not None else None
+        boxes = np.load(s["boxes_path"]).astype(np.float32)
+        with open(s["meta_path"], encoding="utf-8") as f:
+            metadata = json.load(f)
+        if metadata.get("schema_version") != 1 or metadata.get("box_format") != "normalized_xyxy_exclusive":
+            raise ValueError(f"Unsupported motion metadata: {s['meta_path']}")
+        if boxes.shape != (flow_rise_np.shape[0], 4) or not np.isfinite(boxes).all():
+            raise ValueError("Invalid ROI boxes / motion ROI count")
+        if np.any(boxes < 0) or np.any(boxes > 1) or np.any(boxes[:, 2:] <= boxes[:, :2]):
+            raise ValueError("ROI boxes must be normalized nondegenerate xyxy")
+        au_np = np.load(s["au_path"]) if s["au_path"] is not None else None
+        label = int(np.load(s["label_path"]))
+        # One flip draw for the whole sample, BEFORE photometric transforms.
+        # Unilateral AU annotations require an explicit AU permutation.
+        may_flip = au_np is None or "au_flip_permutation" in metadata
+        if getattr(self.transform, "train", False) and random.random() < 0.5 and may_flip:
+            from PIL import ImageOps
+            apex_img, onset_img = ImageOps.mirror(apex_img), ImageOps.mirror(onset_img)
+            if offset_img is not None:
+                offset_img = ImageOps.mirror(offset_img)
+            flow_rise_np, flow_fall_np, boxes, au_np = flip_sample(
+                flow_rise_np, flow_fall_np, boxes, metadata, au_np)
         if self.transform is not None:
             if offset_img is not None:
                 apex_t, onset_t, offset_t = self.transform(apex_img, onset_img, offset_img)
@@ -229,26 +279,14 @@ class FourDME_Dataset(Dataset):
                 apex_t, onset_t = self.transform(apex_img, onset_img)
                 offset_t = None
         else:
-            # Fallback: bare, un-normalized tensors -- for debugging only.
             apex_t = torch.from_numpy(np.array(apex_img)).permute(2, 0, 1).float() / 255.0
             onset_t = torch.from_numpy(np.array(onset_img)).permute(2, 0, 1).float() / 255.0
             offset_t = (torch.from_numpy(np.array(offset_img)).permute(2, 0, 1).float() / 255.0
                         if offset_img is not None else None)
 
-        flow_rise_np = np.load(s["flow_path"])
-        flow_fall_np = np.load(s["flow_fall_path"]) if s["flow_fall_path"] is not None else None
-        au_np = np.load(s["au_path"]) if s["au_path"] is not None else None
-        label = int(np.load(s["label_path"]))
-
-        if getattr(self.transform, "train", False) and random.random() < 0.5:
-            flow_rise_np = np.flip(flow_rise_np, axis=-1).copy()  # flip width axis, every ROI
-            flow_rise_np[:, 0, :, :] *= -1                         # u-channel (index 0): flip sign
-            if flow_fall_np is not None:
-                flow_fall_np = np.flip(flow_fall_np, axis=-1).copy()
-                flow_fall_np[:, 0, :, :] *= -1
-
         item = {
             "apex":      apex_t,
+            "roi_boxes": torch.from_numpy(boxes).float(),
             "onset":     onset_t,
             "flow_rise": torch.from_numpy(flow_rise_np).float(),
             "label":     torch.tensor(label, dtype=torch.long),

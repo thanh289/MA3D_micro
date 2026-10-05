@@ -170,6 +170,16 @@ def get_loso_dataloaders(args):
                                                    # produced by that
                                                    # dataset's run_inference_flow*.py
 
+    manifest_path = os.path.join(root, "dataset_info.json")
+    if os.path.exists(manifest_path):
+        import json
+        with open(manifest_path, encoding="utf-8") as f:
+            info = json.load(f)
+        if args.num_classes != info["num_classes"] or args.n_roi != info["n_roi"]:
+            raise ValueError("Training class/ROI configuration differs from dataset_info.json")
+        if getattr(args, "use_au", False) and args.au_dim != info["au_dim"]:
+            raise ValueError("Training AU dimension differs from preprocessing schema")
+
     train_tf = PairedFaceTransform(img_size=224, train=True)
     val_tf   = PairedFaceTransform(img_size=224, train=False)
 
@@ -189,11 +199,8 @@ def get_loso_dataloaders(args):
     # decision from chat: GAMDSS's own reference protocol only relabels the
     # train side, keeping evaluation on the officially annotated
     # key-frames so results stay comparable to other papers' benchmarks.
-    # use_rise_fall/load_offset/load_au, however, apply to BOTH views -- a
-    # model trained with a given input signature needs the same inputs at
-    # val time too, to actually exercise every branch; only file_suffix
-    # (gamdss vs. original) differs between train/val, not which files
-    # get loaded.
+    # Preserve the train/val sample cohort; decision_level evaluation
+    # does not load fall arrays even though dual-phase training needs them.
     dataset_train_view = dataset_cls(root, transform=train_tf, flow_key="flow_map",
                                       flow_fall_key="flow_map_fall",
                                       use_rise_fall=use_rise_fall,
@@ -204,6 +211,7 @@ def get_loso_dataloaders(args):
     dataset_val_view   = dataset_cls(root, transform=val_tf,   flow_key="flow_map",
                                       flow_fall_key="flow_map_fall",
                                       use_rise_fall=use_rise_fall,
+                                      load_fall=use_rise_fall and getattr(args, "rise_fall_mode", "feature_gate") == "feature_gate",
                                       load_offset=load_offset,
                                       load_au=load_au,
                                       file_suffix="")

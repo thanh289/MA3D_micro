@@ -12,6 +12,7 @@ from .motion_encoder import MotionEncoderCNN
 from .motion_encoder_rmt import RMTMotionEncoder
 from .appearance_encoder import AppearanceEncoderViT
 from .rise_fall_fusion import RiseFallAgreementFusion
+from .roi_alignment import sample_rois, ROIContextAggregator
 
 
 def load_pretrained_weights(model, checkpoint):
@@ -68,150 +69,14 @@ class ClassificationHead(nn.Module):
 
 
 class MA3D(nn.Module):
+    """Three-stream ROI model for CNN motion; legacy full-face RMT ablation.
+
+    CNN: independent motion ROIs, apex geometry sampled using the SAME
+    normalized boxes, and onset crops encoded independently. Local FiLM
+    and cross-interaction precede attention across ROI summaries.
+    decision_level uses fall only for the training objective.
+    Existing optimization and constructor parameters are retained.
     """
-    New architecture direction (ME). The three branches are re-purposed
-    instead of removed:
-
-      - Motion branch (flow, MotionEncoderCNN, trained from scratch):
-        the MAIN CONTENT branch (used to be the IR50-on-apex role in the
-        original MaE architecture). Fed with the 3-ROI optical-flow map
-        (eyebrow, eye, mouth).
-
-      - Landmark branch (MobileFaceNet, frozen): the FiLM MODULATOR (used
-        to be the 3DMM-parameter role). Fed with APEX -- apex is when the
-        AU activation is most expressed, giving the most informative
-        "where on the face is this happening" signal. Does not
-        participate in cross-attention directly.
-
-        Route B (decided): modulation is now SPATIAL, not
-        channel-only. The original FiLM (kept in ThreeDMM_Adaptive.py as
-        LandmarkModulationFusion, for comparison) pools the landmark map
-        down to a single vector and broadcasts (gamma, beta) uniformly
-        over the whole 7x7 motion map -- which cannot express "amplify
-        THIS region, not that one", even though that's exactly what this
-        branch is supposed to be doing. SpatialLandmarkModulationFusion
-        instead keeps the landmark map's 7x7 spatial grid (it's already
-        aligned 1:1 with the motion map's grid, no resize needed) and
-        produces a PER-POSITION (gamma, beta).
-
-      - Appearance-context branch: the CROSS-ATTENTION partner (used to be
-        the landmark's role in the original MaE architecture). Fed with
-        ONSET -- a neutral reference frame, avoiding redundancy with the
-        AU-expressed pose already carried by the motion+landmark branches.
-
-        Route C1 (decided): no longer a frozen, full-depth IR50.
-        IR50 here was trained under an ArcFace objective, whose explicit
-        goal is to become INVARIANT to expression (keep identity, discard
-        everything else) -- using it, frozen, to supply "where is this
-        expression happening" context works against what it was trained
-        to do, and that risk is larger for ME (an already-weak signal)
-        than it was in the MaE-domain original. AppearanceEncoderViT is a
-        shallow (depth=2), TRAINED-FROM-SCRATCH transformer instead,
-        borrowing GAMDSS's "vit_pos" design: the raw onset frame is
-        bilinearly downsampled directly to a 7x7 grid (no conv stem),
-        patchified with patch_size=1, then run through 2 Transformer
-        blocks -- deliberately shallow so it can't re-learn identity, only
-        coarse positional structure (same rationale TSFmicro and GAMDSS
-        both use for their equivalent "static/context" branch).
-
-    pyramid_fuse (bidirectional cross-attention), SE_block and
-    ClassificationHead are UNCHANGED -- Route B/C1 only swap what feeds
-    into them, not the fusion mechanism itself.
-
-    Rise/fall dual-branch motion (use_rise_fall, decided in chat). The
-    motion branch above can optionally be fed TWO flow maps -- rise-phase
-    (onset->apex) AND fall-phase (apex->offset) -- through the SAME
-    MotionEncoderCNN instance (shared weights, called twice). How the two
-    phases get combined into a final prediction is controlled by
-    rise_fall_mode, since neither reference paper's ACTUAL code (verified
-    against CausalNet's and GAMDSS's real source, not just their paper
-    text) agrees on a single "correct" mechanism -- see chat notes:
-
-      - rise_fall_mode="feature_gate" (this codebase's own design, NOT a
-        faithful port of either paper): X_rise, X_fall combined via
-        RiseFallAgreementFusion (rise_fall_fusion.py) into ONE fused
-        motion representation BEFORE landmark FiLM + pyramid_fuse -- i.e.
-        rise/fall fusion and landmark FiLM are STACKED, landmark FiLM
-        itself unchanged. Two small auxiliary classification heads
-        (aux_head_rise, aux_head_fall) are applied to each phase's pooled
-        feature BEFORE fusion, for extra gradient signal. pyramid_fuse
-        runs ONCE (cheaper).
-
-      - rise_fall_mode="decision_level" (matches GAMDSS's ACTUAL BDRT class
-        AND its real training script, verified against real source): NO
-        feature-level fusion at all. landmark FiLM + pyramid_fuse +
-        se_block + head (all shared-weight instances) run TWICE, once per
-        phase, producing out_rise and out_fall as two INDEPENDENT full
-        logit vectors -- exactly how GAMDSS's BDRT.forward() returns (out,
-        out_b). The final prediction `out` is out_rise ONLY -- the
-        fall-phase output out_fall is used SOLELY as an auxiliary loss
-        term (aux["fall"]), never averaged into the prediction. This
-        matches the actual GAMDSS training script exactly: `ALL, s =
-        net(...)`; `loss = CE(ALL,y) + CE(s,y)`; `predicts =
-        torch.max(ALL, 1)` -- s/out_fall never touches the prediction.
-        pyramid_fuse runs TWICE (roughly 2x the compute of feature_gate
-        mode) even though only one of the two outputs is actually used as
-        the prediction -- the second pass exists purely to generate a
-        useful gradient signal for the shared weights via the auxiliary
-        loss.
-
-    AU-guidance branch (use_au, added inspired by STAG's "AU Guidance"
-    step -- STAG itself has no public code, this is our own design, not a
-    port): OPTIONAL side branch, orthogonal to everything above (works
-    with any use_rise_fall/rise_fall_mode/motion_backbone combination).
-
-      x_au [B, au_dim] (au_dim=36 by default: 18 dynamic-AU one-hot +
-      18 static-AU "(k)" one-hot slots, see au_utils.py for the parsing
-      convention and the exact vocab) -> au_encoder (2-layer MLP, matches
-      STAG's own "binary AU vector -> MLP -> f_au" design) -> au_embed
-      [B, au_embed_dim] -> CONCATENATED onto the pooled fusion feature
-      (post se_block, pre head) -> head's input_dim becomes
-      512 + au_embed_dim instead of 512.
-
-      Applied inside _film_and_classify (the shared tail), so in
-      rise_fall_mode="decision_level" the SAME au_embed (computed once in
-      forward(), not per-phase -- AU annotation is a property of the
-      whole clip, not of rise vs. fall separately) is concatenated on
-      BOTH the rise-phase and fall-phase passes.
-
-      When use_au=False (default), behaves exactly as before -- x_au is
-      simply ignored, head's input_dim stays 512.
-
-    NOTE for rise_fall_mode="decision_level": GAMDSS's real BDRT also
-      sources the position-calibration branch from a DIFFERENT frame per
-      phase (onset for rise, apex for fall). This codebase does NOT
-      replicate that -- the landmark branch stays fixed on APEX and the
-      appearance branch stays fixed on ONSET for BOTH phases, only the
-      MOTION input changes per pass. This keeps rise_fall_mode a
-      cleanly-scoped ablation of "how to combine rise+fall" without also
-      conflating a second, separate change (which frame feeds the
-      landmark/appearance branches per phase).
-
-    When use_rise_fall=False, forward() behaves exactly like the original
-    single-phase (rise-only) version regardless of rise_fall_mode.
-
-    motion_backbone (decided in chat, GAMDSS-inspired): swaps WHAT encodes
-    motion, orthogonal to use_rise_fall/rise_fall_mode above (works with
-    either):
-
-      - motion_backbone="cnn" (default, unchanged): MotionEncoderCNN,
-        trained from scratch, operating on the 3-ROI-cropped flow map
-        (x_flow_rise / x_flow_fall, [B, n_roi, 3, H, W] -- eyebrow, eye,
-        mouth crops from run_inference_flow.py).
-
-      - motion_backbone="rmt": RMTMotionEncoder (motion_encoder_rmt.py),
-        wrapping GAMDSS's real RMT_T3/VisRetNet retention-based backbone
-        (RMT.py, copied verbatim from GAMDSS's source). Operates on a
-        WHOLE-FACE pixel-diff instead of ROI crops -- GAMDSS's real
-        architecture has no ROI-cropping concept at all -- computed ON THE
-        FLY inside forward() from the already-available RGB frames
-        (rise: x_apex - x_onset; fall: x_offset - x_apex, x_offset being a
-        NEW optional forward() argument), NOT from flow_map.npy/
-        flow_map_fall.npy at all (those are ignored when motion_backbone=
-        "rmt", though still required as positional args for interface
-        compatibility -- pass anything of the right shape, e.g. zeros).
-    """
-
     def __init__(self, img_size=224, num_classes=7, type="large",
                  n_roi=3, landmark_embed_dim=256, num_film_blocks=5,
                  use_spatial_film=True, use_rise_fall=True,
@@ -249,6 +114,8 @@ class MA3D(nn.Module):
 
         for param in self.face_landback.parameters():
             param.requires_grad = False
+
+        self.face_landback.eval()
 
         # --- Appearance-context branch (Route C1: shallow ViT, trained from
         # scratch -- no checkpoint, no freezing; see class docstring) ---
@@ -318,8 +185,9 @@ class MA3D(nn.Module):
             head_input_dim = 512 + au_embed_dim
 
         self.head = ClassificationHead(input_dim=head_input_dim, target_dim=self.num_classes)
+        self.roi_aggregator = ROIContextAggregator(n_roi, 512) if motion_backbone == "cnn" else None
 
-    def _film_and_classify(self, x_motion, x_lmk_map, x_appear, B, au_embed=None):
+    def _legacy_film_and_classify(self, x_motion, x_lmk_map, x_appear, B, au_embed=None):
         """
         Shared tail of the pipeline: landmark FiLM modulation ->
         pyramid_fuse (bidirectional cross-attention) -> se_block ->
@@ -359,7 +227,7 @@ class MA3D(nn.Module):
         out = self.head(y_hat)
         return out, y_feat, attn_all
 
-    def forward(self, x_apex, x_onset, x_flow_rise, x_flow_fall=None, x_offset=None,
+    def _legacy_forward(self, x_apex, x_onset, x_flow_rise, x_flow_fall=None, x_offset=None,
                 x_au=None):
         """
         x_apex      : [B, 3, 224, 224] RGB apex frame  -> landmark/modulator branch,
@@ -412,7 +280,7 @@ class MA3D(nn.Module):
 
         # --- Optional AU-guidance branch: computed ONCE (AU annotation is
         # a whole-clip property, not rise- or fall-specific), reused by
-        # every _film_and_classify() call below regardless of
+        # every _legacy_film_and_classify() call below regardless of
         # use_rise_fall/rise_fall_mode. ---
         au_embed = None
         if self.use_au:
@@ -431,10 +299,10 @@ class MA3D(nn.Module):
             motion_input_rise = x_apex - x_onset
             motion_input_fall = (x_offset - x_apex) if x_offset is not None else None
 
-        if not self.use_rise_fall:
+        if not self.use_rise_fall or (not self.training and self.rise_fall_mode == "decision_level"):
             # Original single-phase (rise-only) behaviour, unchanged.
             x_motion = self.motion_encoder(motion_input_rise)        # [B, 512, 7, 7]
-            out, y_feat, attn_all = self._film_and_classify(
+            out, y_feat, attn_all = self._legacy_film_and_classify(
                 x_motion, x_lmk_map, x_appear, B, au_embed=au_embed)
             return out, y_feat, attn_all, aux
 
@@ -455,7 +323,7 @@ class MA3D(nn.Module):
             aux["fall"] = self.aux_head_fall(x_motion_fall.mean(dim=[2, 3]))
 
             x_motion, aux["agreement"] = self.rise_fall_fusion(x_motion_rise, x_motion_fall)
-            out, y_feat, attn_all = self._film_and_classify(
+            out, y_feat, attn_all = self._legacy_film_and_classify(
                 x_motion, x_lmk_map, x_appear, B, au_embed=au_embed)
             return out, y_feat, attn_all, aux
 
@@ -465,9 +333,9 @@ class MA3D(nn.Module):
             # main_branch(act, POS) called independently for rise and
             # fall -- verified against the actual GAMDSS training script,
             # not just model.py/RMT.py: `ALL, s = net(...)`.
-            out_rise, feat_rise, attn_rise = self._film_and_classify(
+            out_rise, feat_rise, attn_rise = self._legacy_film_and_classify(
                 x_motion_rise, x_lmk_map, x_appear, B, au_embed=au_embed)
-            out_fall, feat_fall, attn_fall = self._film_and_classify(
+            out_fall, feat_fall, attn_fall = self._legacy_film_and_classify(
                 x_motion_fall, x_lmk_map, x_appear, B, au_embed=au_embed)
 
             # IMPORTANT (corrected after seeing GAMDSS's real training
@@ -493,3 +361,67 @@ class MA3D(nn.Module):
             aux["fall"] = out_fall
 
             return out, y_feat, attn_rise, aux
+
+    def train(self, mode=True):
+        """Freeze parameters AND BatchNorm buffers on the landmark backbone."""
+        super().train(mode)
+        self.face_landback.eval()
+        return self
+
+    def _classify_rois(self, motion, geometry, appearance, boxes, au_embed):
+        B, R, C, H, W = motion.shape
+        motion = motion.reshape(B * R, C, H, W)
+        geometry = geometry.reshape(B * R, C, H, W)
+        if self.use_spatial_film:
+            motion = self.landmark_fusion(motion, geometry)
+        else:
+            motion = self.landmark_fusion(motion, geometry.flatten(2).transpose(1, 2))
+        local, attn = self.pyramid_fuse(motion.flatten(2).transpose(1, 2), appearance)
+        local = local.reshape(B, R, C)
+        fused = self.roi_aggregator(local, boxes)
+        fused = self.se_block(fused)
+        if au_embed is not None:
+            fused = torch.cat([fused, au_embed], dim=-1)
+        return self.head(fused), fused, attn
+
+    def forward(self, x_apex, x_onset, x_flow_rise, x_flow_fall=None,
+                x_offset=None, x_au=None, roi_boxes=None):
+        if self.motion_backbone != "cnn":
+            return self._legacy_forward(x_apex, x_onset, x_flow_rise,
+                                        x_flow_fall, x_offset, x_au)
+        if roi_boxes is None:
+            raise ValueError("ROI CNN requires roi_boxes [B,R,4] from preprocessing; "
+                             "regenerate metadata instead of assuming full-face alignment")
+        B, R = x_flow_rise.shape[:2]
+        if roi_boxes.shape != (B, R, 4):
+            raise ValueError(f"roi_boxes must have shape {(B, R, 4)}")
+        with torch.no_grad():
+            _, full_geometry = self.face_landback(F.interpolate(x_apex, size=112))
+        geometry = sample_rois(full_geometry, roi_boxes, (7, 7)).reshape(B, R, 512, 7, 7)
+        # Crop BEFORE the existing shallow appearance encoder downsamples to 7x7.
+        onset_rois = sample_rois(x_onset, roi_boxes, x_onset.shape[-2:])
+        appearance = self.appearance_encoder(onset_rois)
+        au_embed = None
+        if self.use_au:
+            if x_au is None:
+                raise ValueError("AU-enabled model requires x_au")
+            au_embed = self.au_encoder(x_au)
+        rise = self.motion_encoder.forward_rois(x_flow_rise)
+        aux = {"rise": None, "fall": None, "agreement": None}
+        # At evaluation, decision_level has no dependency on fall input.
+        if not self.use_rise_fall or (not self.training and self.rise_fall_mode == "decision_level"):
+            out, feat, attn = self._classify_rois(rise, geometry, appearance, roi_boxes, au_embed)
+            return out, feat, attn, aux
+        if x_flow_fall is None:
+            raise ValueError("Fall motion required during dual-phase training / feature_gate eval")
+        fall = self.motion_encoder.forward_rois(x_flow_fall)
+        if self.rise_fall_mode == "feature_gate":
+            aux["rise"] = self.aux_head_rise(rise.mean(dim=(1, 3, 4)))
+            aux["fall"] = self.aux_head_fall(fall.mean(dim=(1, 3, 4)))
+            fused, agreement = self.rise_fall_fusion(rise.flatten(0, 1), fall.flatten(0, 1))
+            aux["agreement"] = agreement.reshape(B, R, 1, 7, 7)
+            out, feat, attn = self._classify_rois(fused.reshape_as(rise), geometry, appearance, roi_boxes, au_embed)
+        else:
+            out, feat, attn = self._classify_rois(rise, geometry, appearance, roi_boxes, au_embed)
+            aux["fall"], _, _ = self._classify_rois(fall, geometry, appearance, roi_boxes, au_embed)
+        return out, feat, attn, aux

@@ -110,6 +110,15 @@ class MotionEncoderCNN(nn.Module):
             DeterministicAdaptiveAvgPool2d((7, 7), enabled=deterministic_pool),  # force exactly 7x7, independent of n_roi/roi_pool_size
         )
 
+    def forward_rois(self, x_roi):
+        """Return [B,R,C,7,7]; never mix bins across ROI boundaries."""
+        B, R, C, H, W = x_roi.shape
+        if R != self.n_roi:
+            raise ValueError(f"expected {self.n_roi} ROIs, got {R}")
+        feat = self.roi_conv(x_roi.reshape(B * R, C, H, W))
+        feat = self.merge(feat)
+        return feat.reshape(B, R, *feat.shape[1:])
+
     def forward(self, x_roi):
         B, R, C, H, W = x_roi.shape
         assert R == self.n_roi, f"expected n_roi={self.n_roi}, got {R}"

@@ -182,27 +182,11 @@ class LandmarkModulationFusion(nn.Module):
 # =============================================================================
 # Route B (decided in chat): SPATIAL FiLM.
 #
-# The classes above implement FiLM the standard way -- (gamma, beta) is a
-# per-CHANNEL vector [B, C], pooled from the landmark map's 49 tokens down
-# to a single global descriptor, then broadcast UNIFORMLY over the entire
-# 7x7 motion feature map. That matches the ORIGINAL MA3D-Net's rationale
-# (3DMM params are a global identity/shape descriptor with no natural
-# spatial axis), but it directly contradicts what the landmark branch is
-# supposed to do in the ME architecture: "tell the motion branch which
-# AU-region to trust/amplify" is a claim about WHERE on the face, which a
-# channel-only, spatially-uniform gamma/beta cannot express at all, no
-# matter how well it's trained.
-#
-# x_lmk_map (the landmark branch's raw [B, 512, 7, 7] conv_features, BEFORE
-# it gets flattened into 49 tokens) already sits on the exact same 7x7 grid
-# as x_motion -- both come from a 224x224 input through a stride-32
-# backbone -- so no resize/pooling is needed at all: position (i,j) in the
-# landmark map is the same facial region as position (i,j) in the motion
-# map. The classes below use that alignment directly to produce a
-# PER-POSITION (gamma, beta), i.e. an actual spatial gate/reliability map
-# in the spirit of SAC^2-Net's reliability-aware fusion, instead of a
-# single global scale/shift.
-# =============================================================================
+# Spatial FiLM requires anatomically corresponding input grids, not merely
+# matching tensor dimensions. The ROI CNN path in MA3D samples geometry
+# using the motion ROI boxes BEFORE calling this module. Both tensors then
+# use local ROI coordinates. Deep feature receptive fields can extend beyond
+# each ROI; this is regional alignment rather than exact pixel correspondence.
 
 
 class SpatialFiLMConditionGenerator(nn.Module):

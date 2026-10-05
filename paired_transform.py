@@ -21,9 +21,8 @@ class PairedFaceTransform:
     same spot on both frames, and decorrelating it is a reasonable
     regularizer on its own.
 
-    The actual ME motion signal (the flow map) never goes through this
-    transform at all -- it's precomputed offline by run_inference_flow.py
-    and loaded as a raw array, so none of this augmentation touches it.
+    Geometry augmentation is handled jointly for RGB, motion and ROI boxes
+    by FourDME_Dataset before this photometric transform.
     Extended (optional 3rd argument) to also jointly transform an OFFSET
     frame with the SAME ColorJitter draw as apex/onset
     """
