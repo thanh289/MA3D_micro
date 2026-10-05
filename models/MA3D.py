@@ -9,7 +9,6 @@ from .hyp_crossvit import *
 from .mobilefacenet import MobileFaceNet
 from .ThreeDMM_Adaptive import LandmarkModulationFusion, SpatialLandmarkModulationFusion
 from .motion_encoder import MotionEncoderCNN
-from .motion_encoder_rmt import RMTMotionEncoder
 from .appearance_encoder import AppearanceEncoderViT
 from .rise_fall_fusion import RiseFallAgreementFusion
 from .roi_alignment import sample_rois, ROIContextAggregator
@@ -131,8 +130,6 @@ class MA3D(nn.Module):
         if motion_backbone == "cnn":
             self.motion_encoder = MotionEncoderCNN(n_roi=n_roi, out_channels=512,
                                         deterministic_pool=True)
-        else:  # "rmt"
-            self.motion_encoder = RMTMotionEncoder()
 
         if use_rise_fall and rise_fall_mode == "feature_gate":
             self.rise_fall_fusion = RiseFallAgreementFusion()
