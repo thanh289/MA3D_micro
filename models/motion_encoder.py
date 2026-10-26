@@ -4,27 +4,12 @@ import torch.nn.functional as F
 
 
 class DeterministicAdaptiveAvgPool2d(nn.Module):
-    """
-    Drop-in replacement for nn.AdaptiveAvgPool2d, deterministic on CUDA.
+    """Adaptive pooling with the existing CPU fallback on CUDA.
 
-    adaptive_avg_pool2d's CUDA backward has NO deterministic implementation
-    in PyTorch whenever the input/output spatial ratio isn't evenly
-    divisible (see the UserWarning torch.use_deterministic_algorithms(True,
-    warn_only=True) raises for it) -- true for BOTH poolings in this file
-    (14->3 and (3, 3*n_roi)->(7,7), neither divides evenly). CPU's backward
-    for this op IS deterministic, and the tensors going through this layer
-    are tiny (64 channels, <=14x14) by this point in the network, so
-    round-tripping to CPU just for this op is negligible overhead compared
-    to the rest of a training step -- much cheaper than the alternative of
-    reworking the pooling into a fixed-kernel op that would change its
-    numeric behavior (uneven windows can't be expressed as a single
-    fixed-stride nn.AvgPool2d).
-
-    Set `enabled=False` (or leave the module's `.enabled` off) to skip the
-    CPU round-trip and fall back to plain GPU adaptive pooling when you
-    don't need bit-exact reproducibility (e.g. normal training runs where
-    a little non-determinism from this one op is an acceptable tradeoff
-    for not paying the CPU<->GPU sync cost every forward/backward).
+    When enabled, forward and backward transfer through CPU. This avoids
+    the CUDA adaptive-pooling backward used by the original implementation,
+    but introduces synchronization/transfer overhead; profile on the target
+    GPU. This wrapper alone does not guarantee whole-model determinism.
     """
 
     def __init__(self, output_size, enabled=True):
@@ -109,6 +94,17 @@ class MotionEncoderCNN(nn.Module):
             nn.ReLU(True),
             DeterministicAdaptiveAvgPool2d((7, 7), enabled=deterministic_pool),  # force exactly 7x7, independent of n_roi/roi_pool_size
         )
+
+    def forward_token_rois(self, x_roi):
+        """[B,R,C,g,g], preserving ROI bins; no expansion/packing into 7x7."""
+        B, R, C, H, W = x_roi.shape
+        if R != self.n_roi:
+            raise ValueError(f"expected {self.n_roi} ROIs, got {R}")
+        feat = self.roi_conv(x_roi.reshape(B * R, C, H, W))
+        # Reuse projection/BN/ReLU, skip only the legacy final 7x7 pool.
+        for layer in list(self.merge.children())[:-1]:
+            feat = layer(feat)
+        return feat.reshape(B, R, *feat.shape[1:])
 
     def forward_rois(self, x_roi):
         """Return [B,R,C,7,7]; never mix bins across ROI boundaries."""

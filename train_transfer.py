@@ -39,6 +39,7 @@ from cross_dataset import (
 from engine import train_one_epoch
 from loss_function.loss import LabelSmoothingCrossEntropy, MarginAwareCELoss
 from models.MA3D import MA3D
+from models.fullface_context import add_roi_token_args, roi_token_kwargs
 
 
 PROTOCOL_NAME = "full_source_cross_dataset_with_target_oracle"
@@ -112,6 +113,7 @@ def get_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--wandb_run_name", default=None)
     parser.add_argument("--wandb_mode", choices=["online", "offline", "disabled"], default="online")
     parser.add_argument("--wandb_watch_model", action="store_true")
+    add_roi_token_args(parser)
     return parser.parse_args(argv)
 
 
@@ -212,6 +214,7 @@ def _plot_confusion(y_true, y_pred):
 
 def _build_model_config(args: argparse.Namespace, au_dim: int) -> Dict[str, object]:
     return {
+        **roi_token_kwargs(args),
         "num_classes": 3,
         "type": args.model_type,
         "n_roi": args.n_roi,

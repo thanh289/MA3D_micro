@@ -3,6 +3,7 @@ os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 import torch
 import torch.optim as optim
 from models.MA3D import MA3D
+from models.fullface_context import add_roi_token_args, roi_token_kwargs
 from loss_function.loss import MarginAwareCELoss, LabelSmoothingCrossEntropy
 from models.sam import SAM
 
@@ -142,6 +143,7 @@ def get_args():
                         choices=["online", "offline", "disabled"])
     parser.add_argument("--wandb_watch_model", action="store_true")
 
+    add_roi_token_args(parser)
     return parser.parse_args()
 
 
@@ -265,7 +267,8 @@ def run_fold(args, train_loader, val_loader, device, fold_tag=None):
                   motion_backbone=args.motion_backbone,
                   use_au=args.use_au,
                   au_dim=args.au_dim,
-                  au_embed_dim=args.au_embed_dim).to(device)
+                  au_embed_dim=args.au_embed_dim,
+                  **roi_token_kwargs(args)).to(device)
 
     if use_wandb and args.wandb_watch_model:
         wandb.watch(model, log="all", log_freq=100)
@@ -289,6 +292,8 @@ def run_fold(args, train_loader, val_loader, device, fold_tag=None):
     if args.resume and os.path.exists(resume_path):
         print(f"Loading checkpoint from {resume_path}")
         checkpoint = torch.load(resume_path, map_location=device)
+        if checkpoint.get('architecture') != 'roi_tokens_fullface_v1' or checkpoint.get('model_config') != model.model_config:
+            raise ValueError('Resume requires a matching ROI-token/full-face architecture and model_config')
         model.load_state_dict(checkpoint["model"])
         optimizer.load_state_dict(checkpoint["optimizer"])
         scheduler.load_state_dict(checkpoint["scheduler"])
@@ -332,6 +337,8 @@ def run_fold(args, train_loader, val_loader, device, fold_tag=None):
         is_best = val_uf1 > best_val_uf1
 
         state = {
+            "architecture": "roi_tokens_fullface_v1",
+            "model_config": model.model_config,
             "epoch":        epoch,
             "model":        model.state_dict(),
             "optimizer":    optimizer.state_dict(),

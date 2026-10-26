@@ -182,11 +182,11 @@ class LandmarkModulationFusion(nn.Module):
 # =============================================================================
 # Route B (decided in chat): SPATIAL FiLM.
 #
-# Spatial FiLM requires anatomically corresponding input grids, not merely
-# matching tensor dimensions. The ROI CNN path in MA3D samples geometry
-# using the motion ROI boxes BEFORE calling this module. Both tensors then
-# use local ROI coordinates. Deep feature receptive fields can extend beyond
-# each ROI; this is regional alignment rather than exact pixel correspondence.
+# Spatial FiLM requires a condition at each motion location. In the current
+# ROI-token path, motion queries full-face geometry via cross-attention and
+# the returned contexts are reshaped to each ROI's g x g grid. These are
+# learned conditions, not direct crops or exact pixel correspondences.
+
 
 
 class SpatialFiLMConditionGenerator(nn.Module):
@@ -202,7 +202,7 @@ class SpatialFiLMConditionGenerator(nn.Module):
     FiLMConditionGenerator: all blocks stay driven by the same underlying
     landmark evidence, instead of each block interpreting it independently).
 
-    Input:  x_lmk_map [B, in_dim, H, W]  (H=W=7 in this codebase)
+    Input:  x_lmk_map [B, in_dim, H, W] (condition map; H=W=g for ROI tokens)
     Output: gamma, beta -- each [B, num_blocks, channels, H, W]
     """
 

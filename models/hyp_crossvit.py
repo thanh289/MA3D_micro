@@ -1,8 +1,6 @@
 import torch
 from torch import nn, einsum
 import torch.nn.functional as F
-from einops import rearrange, repeat
-from einops.layers.torch import Rearrange
 
 import numpy as np
 from functools import partial
@@ -63,9 +61,10 @@ class DropPath(nn.Module):
 
 
 class Attention_img(nn.Module):
-    def __init__(self, dim, in_chans, q_chanel, num_heads=8, qkv_bias=False, attn_drop=0., proj_drop=0.):
+    def __init__(self, dim, in_chans, q_chanel, num_heads=8, qkv_bias=False, attn_drop=0., proj_drop=0., query_aligned=False):
         super().__init__()
         self.num_heads = num_heads
+        self.query_aligned = query_aligned
         self.img_chanel = in_chans + 1
         head_dim = dim // num_heads
         self.scale = head_dim ** -0.5
@@ -80,25 +79,27 @@ class Attention_img(nn.Module):
         x_img = x[:, :self.img_chanel, :]
         x_lm = x[:, self.img_chanel:, :]
 
-        B, N, C = x_img.shape
-        kv = self.kv(x_img).reshape(B, N, 2, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        source, query = (x_lm, x_img) if self.query_aligned else (x_img, x_lm)
+        B, N, C = source.shape
+        kv = self.kv(source).reshape(B, N, 2, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
 
         k, v = kv.unbind(0) # make torchscript happy (cannot use tensor as tuple)
-        q = x_lm.reshape(B, -1, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
+        q = query.reshape(B, -1, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
         attn = (q @ k.transpose(-2, -1)) * self.scale
         attn = attn.softmax(dim=-1)
         attn = self.attn_drop(attn)
 
-        x_img = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        x_img = (attn @ v).transpose(1, 2).reshape(B, query.shape[1], C)
         x_img = self.proj(x_img)
         x_img = self.proj_drop(x_img)
 
         return x_img, attn
 
 class Attention_lm(nn.Module):
-    def __init__(self, dim, in_chans, q_chanel, num_heads=8, qkv_bias=False, attn_drop=0., proj_drop=0.):
+    def __init__(self, dim, in_chans, q_chanel, num_heads=8, qkv_bias=False, attn_drop=0., proj_drop=0., query_aligned=False):
         super().__init__()
         self.num_heads = num_heads
+        self.query_aligned = query_aligned
         self.img_chanel = in_chans + 1
         head_dim = dim // num_heads
         self.scale = head_dim ** -0.5
@@ -113,16 +114,17 @@ class Attention_lm(nn.Module):
         x_img = x[:, :self.img_chanel, :]
         x_lm = x[:, self.img_chanel:, :]
 
-        B, N, C = x_lm.shape
-        kv = self.kv(x_lm).reshape(B, N, 2, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        source, query = (x_img, x_lm) if self.query_aligned else (x_lm, x_img)
+        B, N, C = source.shape
+        kv = self.kv(source).reshape(B, N, 2, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
 
         k, v = kv.unbind(0) # make torchscript happy (cannot use tensor as tuple)
-        q = x_img.reshape(B, -1, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
+        q = query.reshape(B, -1, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
         attn = (q @ k.transpose(-2, -1)) * self.scale
         attn = attn.softmax(dim=-1)
         attn = self.attn_drop(attn)
 
-        x_lm = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        x_lm = (attn @ v).transpose(1, 2).reshape(B, query.shape[1], C)
         x_lm = self.proj(x_lm)
         x_lm = self.proj_drop(x_lm)
 
@@ -131,15 +133,15 @@ class Attention_lm(nn.Module):
 class Block(nn.Module):
 
     def __init__(self, dim, in_chans, q_chanel, num_heads, mlp_ratio=4., qkv_bias=False, drop=0., attn_drop=0.,
-                 drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm):
+                 drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm, query_aligned=False):
         super().__init__()
         self.norm1 = norm_layer(dim)
         self.img_chanel = in_chans + 1
         self.num_channels = in_chans + q_chanel + 2
         self.attn_img = Attention_img(dim, in_chans = in_chans, q_chanel = q_chanel, num_heads=num_heads, qkv_bias=qkv_bias,
-                              attn_drop=attn_drop, proj_drop=drop)
+                              attn_drop=attn_drop, proj_drop=drop, query_aligned=query_aligned)
         self.attn_lm = Attention_lm(dim, in_chans=in_chans, q_chanel=q_chanel, num_heads=num_heads, qkv_bias=qkv_bias,
-                                  attn_drop=attn_drop, proj_drop=drop)
+                                  attn_drop=attn_drop, proj_drop=drop, query_aligned=query_aligned)
         # NOTE: drop path for stochastic depth, we shall see if this is better than dropout here
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.norm2 = norm_layer(dim)
@@ -175,22 +177,22 @@ class Block(nn.Module):
 class PyramidBlock(nn.Module):
 
     def __init__(self, dim, in_chans, q_chanel, num_heads, mlp_ratio=4., qkv_bias=False, drop=0., attn_drop=0.,
-                 drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm):
+                 drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm, query_aligned=False):
         super().__init__()
         self.block_l = Block(
                 dim=dim, in_chans=in_chans, q_chanel=q_chanel, num_heads=num_heads,
                 mlp_ratio=mlp_ratio, qkv_bias=qkv_bias,drop=drop, attn_drop=attn_drop,
-                drop_path=drop_path, norm_layer=norm_layer, act_layer=act_layer)
+                drop_path=drop_path, norm_layer=norm_layer, act_layer=act_layer, query_aligned=query_aligned)
 
         self.block_m = Block(
             dim=dim//2, in_chans=in_chans, q_chanel=q_chanel, num_heads=num_heads,
             mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, drop=drop, attn_drop=attn_drop,
-            drop_path=drop_path, norm_layer=norm_layer, act_layer=act_layer)
+            drop_path=drop_path, norm_layer=norm_layer, act_layer=act_layer, query_aligned=query_aligned)
 
         self.block_s = Block(
             dim=dim//4, in_chans=in_chans, q_chanel=q_chanel, num_heads=num_heads,
             mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, drop=drop, attn_drop=attn_drop,
-            drop_path=drop_path, norm_layer=norm_layer, act_layer=act_layer)
+            drop_path=drop_path, norm_layer=norm_layer, act_layer=act_layer, query_aligned=query_aligned)
 
         n_channels = (in_chans+1) + (q_chanel+1)
 
@@ -223,11 +225,12 @@ class HyVisionTransformer(nn.Module):
     def __init__(self, in_chans=49, q_chanel = 49, num_classes=1000, embed_dim=512, depth=12,
                  num_heads=8, mlp_ratio=4., qkv_bias=True, distilled=False,
                  drop_rate=0., attn_drop_rate=0., drop_path_rate=0.,  norm_layer=None,
-                 act_layer=None, weight_init=''):
+                 act_layer=None, weight_init='', query_aligned=False):
 
         super().__init__()
         self.num_classes = num_classes
         self.in_chans = in_chans
+        self.q_chanel = q_chanel
         self.num_features = self.embed_dim = embed_dim  # num_features for consistency with other models
         norm_layer = norm_layer or partial(nn.LayerNorm, eps=1e-6)
         act_layer = act_layer or nn.GELU
@@ -244,18 +247,20 @@ class HyVisionTransformer(nn.Module):
         # self.blocks = nn.Sequential(*[
         #     PyramidBlock(
         #         dim=embed_dim, in_chans=in_chans, q_chanel=q_chanel, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias,
-        #         drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer, act_layer=act_layer)
+        #         drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer, act_layer=act_layer, query_aligned=query_aligned)
         #     for i in range(depth)])
 
         self.blocks = nn.ModuleList([PyramidBlock(
                 dim=embed_dim, in_chans=in_chans, q_chanel=q_chanel, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias,
-                drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer, act_layer=act_layer)
+                drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer, act_layer=act_layer, query_aligned=query_aligned)
             for i in range(depth)])
         self.norm = norm_layer(embed_dim)
 
 
 
     def forward(self, x, x_lm):
+        if x.shape[1] != self.in_chans or x_lm.shape[1] != self.q_chanel:
+            raise ValueError('Cross-interaction token counts do not match model configuration')
         B = x.shape[0]
         x_cls = torch.mean(x, 1).view(B,1,-1)
         x = torch.cat((x_cls, x), dim=1)

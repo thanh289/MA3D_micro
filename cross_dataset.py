@@ -484,7 +484,8 @@ def predict_loader(model, loader: DataLoader, criterion, device: str):
 
     for batch in loader:
         apex, onset, flow_rise, flow_fall, offset, au, labels = prepare_batch(batch, device)
-        logits, _, _, _ = model(apex, onset, flow_rise, flow_fall, offset, au)
+        logits, _, _, _ = model(apex, onset, flow_rise, flow_fall, offset, au,
+                                roi_boxes=batch["roi_boxes"].to(device, non_blocking=True))
         loss = criterion(logits, labels)
         preds = logits.argmax(dim=1)
 
