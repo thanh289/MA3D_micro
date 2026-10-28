@@ -34,6 +34,27 @@ def set_seed(seed: int):
     torch.use_deterministic_algorithms(True, warn_only=True)
 
 
+def build_optimizer(model, args):
+    """Optional branch LR; appearance is scratch-trained, including its projection."""
+    scale = args.appearance_lr_scale
+    if not (0 < scale < float("inf")):
+        raise ValueError("appearance_lr_scale must be finite and positive")
+    if scale == 1.0:
+        # Preserve parameter order/layout for legacy single-group checkpoints.
+        return torch.optim.AdamW(model.parameters(), lr=args.lr,
+                                 weight_decay=args.weight_decay)
+    encoder = getattr(model, "appearance_encoder", None)
+    appearance = [] if encoder is None else [p for p in encoder.parameters() if p.requires_grad]
+    if not appearance:
+        raise ValueError("Non-default appearance_lr_scale requires an enabled appearance encoder")
+    ids = {id(p) for p in appearance}
+    other = [p for p in model.parameters() if p.requires_grad and id(p) not in ids]
+    return torch.optim.AdamW([
+        {"params": other, "lr": args.lr, "name": "other"},
+        {"params": appearance, "lr": args.lr * scale, "name": "appearance"},
+    ], lr=args.lr, weight_decay=args.weight_decay)
+
+
 def get_args():
     parser = argparse.ArgumentParser("SFER Training")
 
@@ -49,6 +70,11 @@ def get_args():
                         help="Comma-separated class names in label-index order, "
                              "e.g. 'Negative,Positive,Surprise,Repression,Others'. "
                              "Defaults to '0','1',... if not given.")
+
+    parser.add_argument("--appearance_lr_scale", "--backbone_lr_scale",
+                        dest="appearance_lr_scale", type=float, default=1.0,
+                        help="LR multiplier for the entire scratch-trained appearance encoder; "
+                             "1.0 preserves the original optimizer. backbone_lr_scale is an alias.")
 
     # Training
     parser.add_argument("--epochs", type=int, default=100)
@@ -281,7 +307,7 @@ def run_fold(args, train_loader, val_loader, device, fold_tag=None):
     # optimizer = SAM(model.parameters(), base_optimizer,
     #                 lr=args.lr, weight_decay=args.weight_decay,
     #                 rho=0.5, adaptive=True)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    optimizer = build_optimizer(model, args)
     scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.98)
 
     start_epoch = 0
@@ -294,6 +320,9 @@ def run_fold(args, train_loader, val_loader, device, fold_tag=None):
         checkpoint = torch.load(resume_path, map_location=device)
         if checkpoint.get('architecture') != 'roi_tokens_fullface_v1' or checkpoint.get('model_config') != model.model_config:
             raise ValueError('Resume requires a matching ROI-token/full-face architecture and model_config')
+        saved_scale = checkpoint.get("appearance_lr_scale", 1.0)
+        if saved_scale != args.appearance_lr_scale:
+            raise ValueError("Resume requires the same appearance_lr_scale; start a new run for an LR ablation")
         model.load_state_dict(checkpoint["model"])
         optimizer.load_state_dict(checkpoint["optimizer"])
         scheduler.load_state_dict(checkpoint["scheduler"])
@@ -307,6 +336,15 @@ def run_fold(args, train_loader, val_loader, device, fold_tag=None):
 
     for epoch in range(start_epoch, args.epochs):
         epoch_start_time = time.time()
+        # Log rates used for this epoch, before scheduler.step().
+        rates = {g.get("name", "all"): g["lr"] for g in optimizer.param_groups}
+        lr_message = f"LR epoch={epoch+1}: " + ", ".join(f"{k}={v:.8g}" for k, v in rates.items())
+        print(lr_message)
+        if log_f:
+            log_f.write(lr_message + "\n")
+            log_f.flush()
+        if use_wandb:
+            wandb.log({**{f"lr/{k}": v for k, v in rates.items()}, "epoch": epoch+1})
 
         train_loss, train_acc, train_labels, train_preds = train_one_epoch(
             model, train_loader, CE_criterion, lsce_criterion,
@@ -337,6 +375,7 @@ def run_fold(args, train_loader, val_loader, device, fold_tag=None):
         is_best = val_uf1 > best_val_uf1
 
         state = {
+            "appearance_lr_scale": args.appearance_lr_scale,
             "architecture": "roi_tokens_fullface_v1",
             "model_config": model.model_config,
             "epoch":        epoch,
