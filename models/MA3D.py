@@ -78,7 +78,8 @@ class MA3D(nn.Module):
                  rise_fall_mode="feature_gate", motion_backbone="cnn",
                  use_au=False, au_dim=36, au_embed_dim=128,
                  roi_pool_size=3, geometry_heads=4,
-                 geometry_conditioning="cross_attention", use_roi_position=True):
+                 geometry_conditioning="cross_attention", use_roi_position=True,
+                 appearance_fusion="cross_attention"):
         super().__init__()
         if motion_backbone != 'cnn':
             raise ValueError('This ROI-token architecture supports motion_backbone=cnn only')
@@ -90,6 +91,9 @@ class MA3D(nn.Module):
             raise ValueError('Unknown geometry_conditioning')
         if not use_spatial_film and geometry_conditioning == 'cross_attention':
             raise ValueError('Use geometry_conditioning=global_mean for channel-only FiLM')
+        if appearance_fusion not in ('cross_attention', 'none'):
+            raise ValueError('appearance_fusion must be cross_attention or none')
+        self.appearance_fusion = appearance_fusion
         self.n_roi = n_roi
         self.roi_pool_size = roi_pool_size
         self.geometry_conditioning = geometry_conditioning
@@ -108,7 +112,8 @@ class MA3D(nn.Module):
             rise_fall_mode=rise_fall_mode, motion_backbone=motion_backbone,
             use_au=use_au, au_dim=au_dim, au_embed_dim=au_embed_dim,
             roi_pool_size=roi_pool_size, geometry_heads=geometry_heads,
-            geometry_conditioning=geometry_conditioning, use_roi_position=use_roi_position)
+            geometry_conditioning=geometry_conditioning, use_roi_position=use_roi_position,
+            appearance_fusion=appearance_fusion)
         self.img_size = img_size
         self.num_classes = num_classes
         self.use_rise_fall = use_rise_fall
@@ -137,9 +142,9 @@ class MA3D(nn.Module):
 
         # --- Appearance-context branch (Route C1: shallow ViT, trained from
         # scratch -- no checkpoint, no freezing; see class docstring) ---
-        self.appearance_encoder = AppearanceEncoderViT(
+        self.appearance_encoder = (AppearanceEncoderViT(
             grid_size=7, embed_dim=512, depth=2, num_heads=4,
-        )
+        ) if appearance_fusion == "cross_attention" else None)
 
         # --- Motion branch (trained from scratch) -- main content ---
         # SHARED weights: when use_rise_fall=True, this SAME instance is
@@ -183,10 +188,11 @@ class MA3D(nn.Module):
             )
 
         # --- Query-aligned pyramid: motion R*g*g tokens, full-face appearance 49 ---
-        self.pyramid_fuse = HyVisionTransformer(in_chans=n_roi * roi_pool_size ** 2, q_chanel=49, embed_dim=512,
+        self.pyramid_fuse = (HyVisionTransformer(in_chans=n_roi * roi_pool_size ** 2, q_chanel=49, embed_dim=512,
                                              query_aligned=True,
                                              depth=depth, num_heads=8, mlp_ratio=2.,
                                              drop_rate=0., attn_drop_rate=0., drop_path_rate=0.1)
+                             if appearance_fusion == "cross_attention" else None)
 
         self.se_block = SE_block(input_dim=512)
 
@@ -233,7 +239,12 @@ class MA3D(nn.Module):
             position = (self.geometry_context.position if self.geometry_context is not None
                         else self.motion_position)
             tokens = tokens + position(xy)
-        fused, attn = self.pyramid_fuse(tokens, appearance)
+        if self.appearance_fusion == 'none':
+            # Pool motion tokens after FiLM and the existing coordinate encoding.
+            # No appearance encoder or pyramid parameters exist in this ablation.
+            fused, attn = tokens.mean(dim=1), []
+        else:
+            fused, attn = self.pyramid_fuse(tokens, appearance)
         fused = self.se_block(fused)
         if au_embed is not None:
             fused = torch.cat([fused, au_embed], dim=-1)
@@ -249,7 +260,8 @@ class MA3D(nn.Module):
             with torch.no_grad():
                 _, geometry = self.face_landback(F.interpolate(x_apex, size=112))
         # Encode full-face onset ONCE, shared by the two phases.
-        appearance = self.appearance_encoder(x_onset)
+        appearance = (self.appearance_encoder(x_onset)
+                      if self.appearance_encoder is not None else None)
         au_embed = None
         if self.use_au:
             if x_au is None:

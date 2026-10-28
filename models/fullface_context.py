@@ -56,6 +56,9 @@ def add_roi_token_args(parser):
     parser.add_argument('--geometry_heads', type=int, choices=[1, 2, 4, 8], default=4)
     parser.add_argument('--geometry_conditioning', choices=['cross_attention', 'global_mean', 'none'],
                         default='cross_attention', help='Geometry-to-FiLM ablation.')
+    parser.add_argument('--appearance_fusion', choices=['cross_attention', 'none'],
+                        default='cross_attention',
+                        help='none removes onset encoder and pyramid; mean-pools motion after FiLM.')
     parser.add_argument('--no_roi_position', action='store_true',
                         help='Disable explicit coordinate encoding (learned pyramid positions remain).')
 
@@ -63,4 +66,5 @@ def add_roi_token_args(parser):
 def roi_token_kwargs(args):
     return dict(roi_pool_size=args.roi_pool_size, geometry_heads=args.geometry_heads,
                 geometry_conditioning=args.geometry_conditioning,
-                use_roi_position=not args.no_roi_position)
+                use_roi_position=not args.no_roi_position,
+                appearance_fusion=args.appearance_fusion)
