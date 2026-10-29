@@ -12,6 +12,7 @@ from engine import train_one_epoch, validate
 import time
 import shutil
 import argparse
+import math
 
 import wandb
 from collections import Counter
@@ -55,6 +56,65 @@ def build_optimizer(model, args):
     ], lr=args.lr, weight_decay=args.weight_decay)
 
 
+def get_scheduler_config(args):
+    """Save the schedule definition as well as its state for safe resume."""
+    if args.lr_scheduler == "exponential":
+        return {"name": "exponential", "gamma": 0.98}
+    if not math.isfinite(args.lr) or args.lr <= 0:
+        raise ValueError("--lr must be finite and positive")
+    if args.epochs < 2:
+        raise ValueError("warmup_cosine requires --epochs >= 2")
+    if args.warmup_epochs != 0 and not (2 <= args.warmup_epochs < args.epochs):
+        raise ValueError("--warmup_epochs must be 0 or between 2 and epochs-1")
+    if not (0 < args.warmup_start_factor <= 1):
+        raise ValueError("--warmup_start_factor must be in (0, 1]")
+    if not math.isfinite(args.min_lr) or not (0 <= args.min_lr <= args.lr):
+        raise ValueError("--min_lr must be finite and between 0 and --lr")
+    return dict(name="warmup_cosine", epochs=args.epochs, base_lr=args.lr,
+                warmup_epochs=args.warmup_epochs,
+                warmup_start_factor=args.warmup_start_factor, min_lr=args.min_lr)
+
+
+def warmup_cosine_factor(epoch_index, config):
+    """Multiplier for the LR USED in zero-based epoch_index (epoch-wise steps).
+
+    For 100 epochs / 5 warm-up epochs: epoch 1 uses start_factor,
+    epoch 5 uses 1.0, and epoch 100 uses min_lr/base_lr.
+    The step after the final epoch stays at the minimum.
+    """
+    index = min(max(epoch_index, 0), config["epochs"] - 1)
+    warmup = config["warmup_epochs"]
+    if warmup and index < warmup:
+        start = config["warmup_start_factor"]
+        return start + (1.0 - start) * index / (warmup - 1)
+    peak_index = max(warmup - 1, 0)
+    progress = (index - peak_index) / (config["epochs"] - 1 - peak_index)
+    floor = config["min_lr"] / config["base_lr"]
+    return floor + (1.0 - floor) * 0.5 * (1.0 + math.cos(math.pi * progress))
+
+
+def build_scheduler(optimizer, config):
+    if config["name"] == "exponential":
+        return torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=config["gamma"])
+    # LambdaLR applies factor(0) at construction, before epoch 1 is trained.
+    # One multiplier for every group preserves appearance_lr_scale throughout.
+    return torch.optim.lr_scheduler.LambdaLR(
+        optimizer, lr_lambda=lambda index: warmup_cosine_factor(index, config))
+
+
+def check_scheduler_resume(checkpoint, config):
+    saved = checkpoint.get("scheduler_config")
+    if saved is None:
+        # Uploaded legacy train.py used only ExponentialLR(gamma=0.98).
+        state = checkpoint.get("scheduler", {})
+        if config["name"] != "exponential" or state.get("gamma") != 0.98:
+            raise ValueError("Legacy checkpoint requires the original exponential scheduler; "
+                             "start a fresh run to try warmup_cosine")
+    elif saved != config:
+        raise ValueError("Resume requires the same scheduler configuration (including total "
+                         "epochs for cosine); start a fresh run to change the schedule")
+
+
 def get_args():
     parser = argparse.ArgumentParser("SFER Training")
 
@@ -80,6 +140,14 @@ def get_args():
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--lr", type=float, default=1e-5)
+    parser.add_argument("--lr_scheduler", choices=["exponential", "warmup_cosine"],
+                        default="exponential", help="Default preserves ExponentialLR(gamma=0.98)")
+    parser.add_argument("--warmup_epochs", type=int, default=5,
+                        help="For warmup_cosine: 0 disables warm-up; otherwise >=2 and <epochs")
+    parser.add_argument("--warmup_start_factor", type=float, default=0.1,
+                        help="Initial LR / peak LR for warmup_cosine")
+    parser.add_argument("--min_lr", type=float, default=5e-6,
+                        help="Final-epoch base LR for cosine; appearance group scales this too")
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--num_workers", type=int, default=8)
     parser.add_argument("--model_type", type=str, default="large",
@@ -308,7 +376,12 @@ def run_fold(args, train_loader, val_loader, device, fold_tag=None):
     #                 lr=args.lr, weight_decay=args.weight_decay,
     #                 rho=0.5, adaptive=True)
     optimizer = build_optimizer(model, args)
-    scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.98)
+    scheduler_config = get_scheduler_config(args)
+    scheduler = build_scheduler(optimizer, scheduler_config)
+    print(f"LR scheduler: {scheduler_config}")
+    if log_f:
+        log_f.write(f"LR scheduler: {scheduler_config}\n")
+        log_f.flush()
 
     start_epoch = 0
     best_val_acc = 0.0
@@ -323,6 +396,7 @@ def run_fold(args, train_loader, val_loader, device, fold_tag=None):
         saved_scale = checkpoint.get("appearance_lr_scale", 1.0)
         if saved_scale != args.appearance_lr_scale:
             raise ValueError("Resume requires the same appearance_lr_scale; start a new run for an LR ablation")
+        check_scheduler_resume(checkpoint, scheduler_config)
         model.load_state_dict(checkpoint["model"])
         optimizer.load_state_dict(checkpoint["optimizer"])
         scheduler.load_state_dict(checkpoint["scheduler"])
@@ -338,6 +412,7 @@ def run_fold(args, train_loader, val_loader, device, fold_tag=None):
         epoch_start_time = time.time()
         # Log rates used for this epoch, before scheduler.step().
         rates = {g.get("name", "all"): g["lr"] for g in optimizer.param_groups}
+        lr = optimizer.param_groups[0]["lr"]  # LR actually used for this epoch
         lr_message = f"LR epoch={epoch+1}: " + ", ".join(f"{k}={v:.8g}" for k, v in rates.items())
         print(lr_message)
         if log_f:
@@ -365,7 +440,6 @@ def run_fold(args, train_loader, val_loader, device, fold_tag=None):
         )
 
         scheduler.step()
-        lr = optimizer.param_groups[0]["lr"]
 
         epoch_time = (time.time() - epoch_start_time) / 60.0
 
@@ -376,6 +450,7 @@ def run_fold(args, train_loader, val_loader, device, fold_tag=None):
 
         state = {
             "appearance_lr_scale": args.appearance_lr_scale,
+            "scheduler_config": scheduler_config,
             "architecture": "roi_tokens_fullface_v1",
             "model_config": model.model_config,
             "epoch":        epoch,
@@ -492,6 +567,7 @@ def run_fold(args, train_loader, val_loader, device, fold_tag=None):
 
 def main():
     args = get_args()
+    get_scheduler_config(args)  # Fail before loading data for invalid schedule arguments.
     set_seed(args.seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
