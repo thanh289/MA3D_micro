@@ -166,7 +166,7 @@ def get_loso_dataloaders(args):
 
     project_root = os.path.dirname(os.path.abspath(__file__))
     data_dir = os.path.join(project_root, "Datasets")
-    root = os.path.join(data_dir, folder_name)  # single merged folder,
+    root = getattr(args, "data_root", None) or os.path.join(data_dir, folder_name)  # single merged folder,
                                                    # produced by that
                                                    # dataset's run_inference_flow*.py
 
@@ -180,7 +180,8 @@ def get_loso_dataloaders(args):
         if getattr(args, "use_au", False) and args.au_dim != info["au_dim"]:
             raise ValueError("Training AU dimension differs from preprocessing schema")
 
-    train_tf = PairedFaceTransform(img_size=224, train=True)
+    train_tf = PairedFaceTransform(img_size=224, train=True,
+                                   erase_apex=getattr(args, "erase_apex", False))
     val_tf   = PairedFaceTransform(img_size=224, train=False)
 
     use_rise_fall = getattr(args, "use_rise_fall", False)

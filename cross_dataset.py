@@ -276,17 +276,20 @@ def build_dataset_view(
     au_schema: str,
     use_gamdss: bool = False,
     verbose: bool = False,
+    erase_apex: bool = False,
+    rise_fall_mode: str = "decision_level",
 ) -> CrossDatasetView:
     dataset_key = normalize_dataset_key(dataset_key)
     spec = DATASET_SPECS[dataset_key]
     root = os.path.abspath(os.path.expanduser(root))
-    transform = PairedFaceTransform(img_size=224, train=train)
+    transform = PairedFaceTransform(img_size=224, train=train, erase_apex=erase_apex)
     base = spec.dataset_cls(
         root,
         transform=transform,
         flow_key="flow_map",
         flow_fall_key="flow_map_fall",
         use_rise_fall=use_rise_fall,
+        load_fall=use_rise_fall and (train or rise_fall_mode == "feature_gate"),
         load_offset=motion_backbone == "rmt",
         load_au=use_au,
         file_suffix="_gamdss" if train and use_gamdss else "",
@@ -339,6 +342,7 @@ def build_full_source_loader(
     use_au: bool,
     au_schema: str,
     use_gamdss: bool,
+    erase_apex: bool = False,
 ) -> Tuple[DataLoader, Mapping[str, object]]:
     dataset_key = normalize_dataset_key(dataset_key)
     train_view = build_dataset_view(
@@ -351,6 +355,7 @@ def build_full_source_loader(
         use_au=use_au,
         au_schema=au_schema,
         use_gamdss=use_gamdss,
+        erase_apex=erase_apex,
         verbose=True,
     )
     labels = _labels_from_view(train_view)
@@ -402,6 +407,7 @@ def build_target_loader(
     motion_backbone: str,
     use_au: bool,
     au_schema: str,
+    rise_fall_mode: str = "decision_level",
 ) -> Tuple[DataLoader, Mapping[str, object]]:
     dataset_key = normalize_dataset_key(dataset_key)
     view = build_dataset_view(
@@ -410,6 +416,7 @@ def build_target_loader(
         train=False,
         n_roi=n_roi,
         use_rise_fall=use_rise_fall,
+        rise_fall_mode=rise_fall_mode,
         motion_backbone=motion_backbone,
         use_au=use_au,
         au_schema=au_schema,

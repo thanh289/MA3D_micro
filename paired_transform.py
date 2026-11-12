@@ -16,10 +16,8 @@ class PairedFaceTransform:
     draws the ColorJitter parameters ONCE per sample and applies them
     identically to both frames instead.
 
-    RandomErasing is applied independently per frame: it's a small-area
-    (5%) synthetic occlusion, there's no physical reason it should hit the
-    same spot on both frames, and decorrelating it is a reasonable
-    regularizer on its own.
+    Apex erasing is off by default because its geometry conditions precomputed
+    motion. Onset/offset erasing is unchanged. Set erase_apex=True for ablation.
 
     Geometry augmentation is handled jointly for RGB, motion and ROI boxes
     by FourDME_Dataset before this photometric transform.
@@ -30,9 +28,10 @@ class PairedFaceTransform:
     def __init__(self, img_size=224, train=True,
                  mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225),
                  jitter_brightness=0.2, jitter_contrast=0.2, jitter_saturation=0.2,
-                 erase_scale=(0.05, 0.05)):
+                 erase_scale=(0.05, 0.05), erase_apex=False):
         self.img_size = img_size
         self.train = train
+        self.erase_apex = erase_apex
         self.normalize = T.Normalize(mean=mean, std=std)
 
         if train:
@@ -68,7 +67,8 @@ class PairedFaceTransform:
             offset_t = self.normalize(offset_t)
 
         if self.train:
-            apex_t = self.random_erasing(apex_t)
+            if self.erase_apex:
+                apex_t = self.random_erasing(apex_t)
             onset_t = self.random_erasing(onset_t)
             if offset_img is not None:
                 offset_t = self.random_erasing(offset_t)

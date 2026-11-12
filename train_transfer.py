@@ -39,7 +39,7 @@ from cross_dataset import (
 from engine import train_one_epoch
 from loss_function.loss import LabelSmoothingCrossEntropy, MarginAwareCELoss
 from models.MA3D import MA3D
-from models.fullface_context import add_roi_token_args, roi_token_kwargs
+from models.fullface_context import add_roi_token_args, roi_token_kwargs, validate_model_args
 
 
 PROTOCOL_NAME = "full_source_cross_dataset_with_target_oracle"
@@ -82,17 +82,17 @@ def get_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
 
     parser.add_argument("--model_type", choices=["small", "base", "large"], default="small")
-    parser.add_argument("--n_roi", type=int, default=6)
+    parser.add_argument("--n_roi", type=int, default=3)
     parser.add_argument("--landmark_embed_dim", type=int, default=256)
-    parser.add_argument("--num_film_blocks", type=int, default=5)
+    parser.add_argument("--num_film_blocks", type=int, default=1)
     parser.add_argument("--use_rise_fall", action="store_true")
     parser.add_argument(
         "--rise_fall_mode",
         choices=["feature_gate", "decision_level"],
-        default="feature_gate",
+        default="decision_level",
     )
     parser.add_argument("--aux_loss_weight", type=float, default=0.2)
-    parser.add_argument("--motion_backbone", choices=["cnn", "rmt"], default="cnn")
+    parser.add_argument("--motion_backbone", choices=["cnn"], default="cnn")
     parser.add_argument("--use_gamdss", action="store_true")
 
     parser.add_argument("--use_au", action="store_true")
@@ -246,6 +246,7 @@ def _validate_resume(checkpoint: Mapping[str, object], current: Mapping[str, obj
 
 def main(argv: Optional[Sequence[str]] = None) -> None:
     args = get_args(argv)
+    validate_model_args(args)
     source = normalize_dataset_key(args.source)
     if source == "smic_hs":
         raise ValueError("SMIC-HS is target-only in this protocol; choose 4dme or casme2 as source")
@@ -289,6 +290,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         "rise_fall_mode": args.rise_fall_mode,
         "motion_backbone": args.motion_backbone,
         "use_gamdss_source_train_only": args.use_gamdss,
+        "erase_apex": args.erase_apex,
         "use_au": args.use_au,
         "au_schema": au_schema if args.use_au else None,
         "au_dim": au_dim if args.use_au else None,
@@ -338,6 +340,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         use_au=args.use_au,
         au_schema=au_schema,
         use_gamdss=args.use_gamdss,
+        erase_apex=args.erase_apex,
     )
     save_json(os.path.join(run_dir, "source_dataset.json"), source_metadata)
     print(json.dumps(source_metadata, indent=2))
@@ -353,6 +356,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             seed=args.seed,
             n_roi=args.n_roi,
             use_rise_fall=args.use_rise_fall,
+            rise_fall_mode=args.rise_fall_mode,
             motion_backbone=args.motion_backbone,
             use_au=args.use_au,
             au_schema=au_schema,
@@ -377,6 +381,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     if args.resume_checkpoint:
         checkpoint = _load_checkpoint(args.resume_checkpoint, device)
         _validate_resume(checkpoint, model_config)
+        if checkpoint.get('input_config') != input_config:
+            raise ValueError('Resume requires matching input and augmentation configuration')
         model.load_state_dict(checkpoint["model"])
         optimizer.load_state_dict(checkpoint["optimizer"])
         scheduler.load_state_dict(checkpoint["scheduler"])
@@ -463,7 +469,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 )
 
             state = {
-                "format_version": 2,
+                "format_version": 3,
+                "architecture": model.architecture,
                 "protocol": PROTOCOL_NAME,
                 "epoch": epoch,
                 "model": model.state_dict(),

@@ -10,6 +10,7 @@ from .motion_encoder import MotionEncoderCNN
 from .appearance_encoder import AppearanceEncoderViT
 from .rise_fall_fusion import RiseFallAgreementFusion
 from .fullface_context import FullFaceGeometryContext, roi_token_coordinates
+from .compact_roi import CompactROIModel
 
 
 def load_pretrained_weights(model, checkpoint):
@@ -65,22 +66,53 @@ class ClassificationHead(nn.Module):
         return y_hat
 
 
-class MA3D(nn.Module):
-    """ROI motion tokens with full-face geometry and onset appearance.
+class MA3D(CompactROIModel):
+    """Default: compact motion ROI transformer; legacy pyramid is opt-in.
 
-    Geometry cross-attention yields a condition per motion token. FiLM keeps
-    local ROI convolutions; one shared pyramid processes the concatenated
-    motion sequence against full-face appearance. No final ROI aggregator.
+    The compact path aggregates motion independently of geometry/appearance.
+    Full configuration is stored in checkpoints; old checkpoints need the
+    legacy architecture explicitly and cannot resume a compact run.
     """
     def __init__(self, img_size=224, num_classes=7, type="large",
-                 n_roi=3, landmark_embed_dim=256, num_film_blocks=5,
-                 use_spatial_film=True, use_rise_fall=True,
-                 rise_fall_mode="feature_gate", motion_backbone="cnn",
+                 n_roi=3, landmark_embed_dim=256, num_film_blocks=1,
+                 use_spatial_film=True, use_rise_fall=False,
+                 rise_fall_mode="decision_level", motion_backbone="cnn",
                  use_au=False, au_dim=36, au_embed_dim=128,
-                 roi_pool_size=3, geometry_heads=4,
-                 geometry_conditioning="cross_attention", use_roi_position=True,
-                 appearance_fusion="cross_attention"):
-        super().__init__()
+                 roi_pool_size=4, geometry_heads=4,
+                 geometry_conditioning="none", use_roi_position=True,
+                 appearance_fusion="none", motion_aggregation="roi_transformer",
+                 motion_dim=128, roi_depth=2, roi_heads=4, roi_dropout=0.1,
+                 geometry_scale_init=0.01,
+                 landmark_checkpoint="checkpoints/mobilefacenet_model_best.pth_o1.tar"):
+        nn.Module.__init__(self)
+        if motion_aggregation not in ('roi_transformer', 'legacy_pyramid'):
+            raise ValueError('Unknown motion_aggregation')
+        if motion_aggregation == 'roi_transformer':
+            if appearance_fusion != 'none' or use_au or motion_backbone != 'cnn':
+                raise ValueError('The compact baseline requires CNN motion, appearance_fusion=none '
+                                 'and use_au=False; use legacy_pyramid for previous branches')
+            if geometry_conditioning == 'roi_residual' and num_film_blocks != 1:
+                raise ValueError('roi_residual uses exactly one modulation block')
+            CompactROIModel.__init__(self, num_classes=num_classes, n_roi=n_roi,
+                motion_dim=motion_dim, roi_pool_size=roi_pool_size, roi_depth=roi_depth,
+                roi_heads=roi_heads, roi_dropout=roi_dropout, use_roi_position=use_roi_position,
+                geometry_conditioning=geometry_conditioning, geometry_scale_init=geometry_scale_init,
+                landmark_checkpoint=landmark_checkpoint, use_rise_fall=use_rise_fall,
+                rise_fall_mode=rise_fall_mode)
+            self.motion_aggregation = motion_aggregation
+            self.model_config = dict(img_size=img_size, num_classes=num_classes, type=type,
+                n_roi=n_roi, landmark_embed_dim=landmark_embed_dim, num_film_blocks=num_film_blocks,
+                use_spatial_film=use_spatial_film, use_rise_fall=use_rise_fall,
+                rise_fall_mode=rise_fall_mode, motion_backbone=motion_backbone, use_au=use_au,
+                au_dim=au_dim, au_embed_dim=au_embed_dim, roi_pool_size=roi_pool_size,
+                geometry_heads=geometry_heads, geometry_conditioning=geometry_conditioning,
+                use_roi_position=use_roi_position, appearance_fusion=appearance_fusion,
+                motion_aggregation=motion_aggregation, motion_dim=motion_dim,
+                roi_depth=roi_depth, roi_heads=roi_heads, roi_dropout=roi_dropout,
+                geometry_scale_init=geometry_scale_init, landmark_checkpoint=landmark_checkpoint)
+            return
+        self.motion_aggregation = motion_aggregation
+        self.architecture = 'roi_tokens_fullface_v1' 
         if motion_backbone != 'cnn':
             raise ValueError('This ROI-token architecture supports motion_backbone=cnn only')
         if roi_pool_size not in (2, 3, 4, 5, 7):
@@ -106,7 +138,8 @@ class MA3D(nn.Module):
         if type == "large":
             depth = 8
 
-        self.model_config = dict(img_size=img_size, num_classes=num_classes, type=type,
+        self.model_config = dict(motion_aggregation=motion_aggregation,
+            landmark_checkpoint=landmark_checkpoint, img_size=img_size, num_classes=num_classes, type=type,
             n_roi=n_roi, landmark_embed_dim=landmark_embed_dim, num_film_blocks=num_film_blocks,
             use_spatial_film=use_spatial_film, use_rise_fall=use_rise_fall,
             rise_fall_mode=rise_fall_mode, motion_backbone=motion_backbone,
@@ -129,16 +162,14 @@ class MA3D(nn.Module):
         self.use_au = use_au
 
         # --- Landmark branch (frozen) -- FiLM modulator source ---
-        self.face_landback = MobileFaceNet([112, 112], 136)
-        face_landback_checkpoint = torch.load(
-            "checkpoints/mobilefacenet_model_best.pth_o1.tar",
-            map_location=lambda storage, loc: storage)
-        self.face_landback.load_state_dict(face_landback_checkpoint['state_dict'])
-
-        for param in self.face_landback.parameters():
-            param.requires_grad = False
-
-        self.face_landback.eval()
+        self.face_landback = None
+        if geometry_conditioning != 'none':
+            self.face_landback = MobileFaceNet([112, 112], 136)
+            if landmark_checkpoint is not None:
+                checkpoint = torch.load(landmark_checkpoint, map_location='cpu', weights_only=True)
+                self.face_landback.load_state_dict(checkpoint['state_dict'])
+            self.face_landback.requires_grad_(False)
+            self.face_landback.eval()
 
         # --- Appearance-context branch (Route C1: shallow ViT, trained from
         # scratch -- no checkpoint, no freezing; see class docstring) ---
@@ -218,7 +249,8 @@ class MA3D(nn.Module):
     def train(self, mode=True):
         """Freeze parameters AND BatchNorm buffers on the landmark backbone."""
         super().train(mode)
-        self.face_landback.eval()
+        if self.face_landback is not None:
+            self.face_landback.eval()
         return self
 
     def _classify_rois(self, motion, geometry, appearance, boxes, au_embed):
@@ -252,6 +284,9 @@ class MA3D(nn.Module):
 
     def forward(self, x_apex, x_onset, x_flow_rise, x_flow_fall=None,
                 x_offset=None, x_au=None, roi_boxes=None):
+        if self.motion_aggregation == 'roi_transformer':
+            return CompactROIModel.forward(self, x_apex, x_onset, x_flow_rise,
+                x_flow_fall, x_offset, x_au, roi_boxes)
         B = x_flow_rise.shape[0]
         if roi_boxes is None or roi_boxes.shape != (B, self.n_roi, 4):
             raise ValueError('ROI-token model requires roi_boxes [B,n_roi,4] from preprocessing')

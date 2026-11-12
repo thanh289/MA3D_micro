@@ -50,21 +50,50 @@ class FullFaceGeometryContext(nn.Module):
 
 
 def add_roi_token_args(parser):
-    """Shared CLI for LOSO and cross-dataset training; old defaults untouched."""
-    parser.add_argument('--roi_pool_size', type=int, choices=[2, 3, 4, 5, 7], default=3,
-                        help='g x g tokens per motion ROI; no preprocessing change needed.')
+    """Shared architecture settings for LOSO and cross-dataset training."""
+    parser.add_argument('--motion_aggregation', choices=['roi_transformer', 'legacy_pyramid'],
+                        default='roi_transformer')
+    parser.add_argument('--motion_dim', type=int, choices=[128, 192], default=128)
+    parser.add_argument('--roi_depth', type=int, choices=[1, 2], default=2)
+    parser.add_argument('--roi_heads', type=int, choices=[1, 2, 4, 8], default=4)
+    parser.add_argument('--roi_dropout', type=float, default=0.1)
+    parser.add_argument('--roi_pool_size', type=int, choices=[2, 3, 4, 5, 7], default=4,
+                        help='Spatial bins per ROI; independent of preprocessing map size.')
+    parser.add_argument('--geometry_scale_init', type=float, default=0.01)
+    parser.add_argument('--landmark_checkpoint',
+                        default='checkpoints/mobilefacenet_model_best.pth_o1.tar',
+                        help='Required only when geometry is enabled.')
     parser.add_argument('--geometry_heads', type=int, choices=[1, 2, 4, 8], default=4)
-    parser.add_argument('--geometry_conditioning', choices=['cross_attention', 'global_mean', 'none'],
-                        default='cross_attention', help='Geometry-to-FiLM ablation.')
-    parser.add_argument('--appearance_fusion', choices=['cross_attention', 'none'],
-                        default='cross_attention',
-                        help='none removes onset encoder and pyramid; mean-pools motion after FiLM.')
+    parser.add_argument('--geometry_conditioning',
+                        choices=['none', 'roi_residual', 'cross_attention', 'global_mean'],
+                        default='none')
+    parser.add_argument('--appearance_fusion', choices=['cross_attention', 'none'], default='none',
+                        help='Compact model requires none; cross_attention is legacy-only.')
     parser.add_argument('--no_roi_position', action='store_true',
-                        help='Disable explicit coordinate encoding (learned pyramid positions remain).')
+                        help='Disable box center/size encoding; ROI identity stays enabled.')
+    parser.add_argument('--erase_apex', action='store_true',
+                        help='Opt in to apex erasing. Default off to preserve geometry/motion consistency.')
 
 
 def roi_token_kwargs(args):
     return dict(roi_pool_size=args.roi_pool_size, geometry_heads=args.geometry_heads,
                 geometry_conditioning=args.geometry_conditioning,
-                use_roi_position=not args.no_roi_position,
-                appearance_fusion=args.appearance_fusion)
+                use_roi_position=not args.no_roi_position, appearance_fusion=args.appearance_fusion,
+                motion_aggregation=args.motion_aggregation, motion_dim=args.motion_dim,
+                roi_depth=args.roi_depth, roi_heads=args.roi_heads, roi_dropout=args.roi_dropout,
+                geometry_scale_init=args.geometry_scale_init,
+                landmark_checkpoint=args.landmark_checkpoint)
+
+
+def validate_model_args(args):
+    if args.motion_aggregation == 'roi_transformer':
+        if args.use_au or args.appearance_fusion != 'none' or args.motion_backbone != 'cnn':
+            raise ValueError('Compact ROI baseline requires CNN, no AU and appearance_fusion=none')
+        if args.geometry_conditioning not in ('none', 'roi_residual'):
+            raise ValueError('Compact geometry must be none or roi_residual')
+        if args.geometry_conditioning == 'roi_residual' and args.num_film_blocks != 1:
+            raise ValueError('roi_residual uses one block; set --num_film_blocks 1')
+        if args.use_rise_fall and args.rise_fall_mode != 'decision_level':
+            raise ValueError('Compact fall auxiliary requires --rise_fall_mode decision_level')
+    elif args.geometry_conditioning == 'roi_residual':
+        raise ValueError('roi_residual is available only with roi_transformer')

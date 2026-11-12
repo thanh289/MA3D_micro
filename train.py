@@ -3,7 +3,7 @@ os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 import torch
 import torch.optim as optim
 from models.MA3D import MA3D
-from models.fullface_context import add_roi_token_args, roi_token_kwargs
+from models.fullface_context import add_roi_token_args, roi_token_kwargs, validate_model_args
 from loss_function.loss import MarginAwareCELoss, LabelSmoothingCrossEntropy
 from models.sam import SAM
 
@@ -121,11 +121,12 @@ def get_args():
     parser.add_argument("--seed", type=int, default=42)
 
     # Dataset
-    parser.add_argument("--data_type", default="RAF-DB",
+    parser.add_argument("--data_type", default="4DME_MOTION",
                         choices=["RAF-DB", "VKIST", "Cheo", "FerPlus", "Caers",
                                  "CheoFaMo", "4DME_MOTION", "CASME2_MOTION",
                                  "SMIC_HS_MOTION"])
-    parser.add_argument("--num_classes", type=int, default=7)
+    parser.add_argument("--num_classes", type=int, default=5)
+    parser.add_argument("--data_root", default=None, help="Preprocessed dataset root for LOSO")
     parser.add_argument("--class_names", type=str, default=None,
                         help="Comma-separated class names in label-index order, "
                              "e.g. 'Negative,Positive,Surprise,Repression,Others'. "
@@ -155,38 +156,23 @@ def get_args():
 
     # MA3D architecture (motion / landmark-modulator / appearance-context)
     parser.add_argument("--n_roi", type=int, default=3,
-                        help="Number of ROI in the flow map (eyebrow, eye, mouth). "
+                        help="Number of ROI: 3 for merged3, 6 for split6. "
                              "Must match the flow_map.npy produced by "
                              "run_inference_flow.py.")
     parser.add_argument("--landmark_embed_dim", type=int, default=256,
                         help="Embedding dim of the landmark-derived FiLM "
                              "condition vector (LandmarkPriorEncoder output).")
-    parser.add_argument("--num_film_blocks", type=int, default=5,
+    parser.add_argument("--num_film_blocks", type=int, default=1,
                         help="Number of FiLM (LandmarkModulationFusion) blocks "
                              "applied to the motion feature map.")
     parser.add_argument("--use_rise_fall", action="store_true")
-    parser.add_argument("--rise_fall_mode", type=str, default="feature_gate",
+    parser.add_argument("--rise_fall_mode", default="decision_level",
                         choices=["feature_gate", "decision_level"],
-                        help="Only has an effect when --use_rise_fall is set. "
-                             "'feature_gate': this codebase's own design (NOT a "
-                             "faithful port of any paper) -- rise/fall features "
-                             "combined via a cosine-similarity agreement map "
-                             "BEFORE landmark FiLM + pyramid_fuse; pyramid_fuse "
-                             "runs ONCE (cheaper). "
-                             "'decision_level': matches GAMDSS's actual BDRT "
-                             "class AND its real training script (verified) -- "
-                             "NO feature-level fusion; landmark FiLM + "
-                             "pyramid_fuse + head run TWICE (once per phase, "
-                             "shared weights), but the FINAL PREDICTION is the "
-                             "rise-phase output ONLY -- fall-phase output is "
-                             "used purely as an auxiliary loss term, never "
-                             "averaged in (matches GAMDSS exactly: predictions "
-                             "come from `ALL`, never from `s`). Roughly 2x the "
-                             "compute of feature_gate mode. See MA3D.py class "
-                             "docstring for full detail on both.")
+                        help="decision_level: shared full classifier for fall auxiliary training, "
+                             "rise-only inference. feature_gate: legacy encoded-feature gate only.")
     parser.add_argument("--aux_loss_weight", type=float, default=0.2)
     parser.add_argument("--motion_backbone", type=str, default="cnn",
-                        choices=["cnn", "rmt"])
+                        choices=["cnn"])
     parser.add_argument("--use_au", action="store_true")
     parser.add_argument("--au_dim", type=int, default=36)
     parser.add_argument("--au_embed_dim", type=int, default=128)
@@ -391,8 +377,10 @@ def run_fold(args, train_loader, val_loader, device, fold_tag=None):
     if args.resume and os.path.exists(resume_path):
         print(f"Loading checkpoint from {resume_path}")
         checkpoint = torch.load(resume_path, map_location=device)
-        if checkpoint.get('architecture') != 'roi_tokens_fullface_v1' or checkpoint.get('model_config') != model.model_config:
+        if checkpoint.get('architecture') != model.architecture or checkpoint.get('model_config') != model.model_config:
             raise ValueError('Resume requires a matching ROI-token/full-face architecture and model_config')
+        if checkpoint.get('erase_apex', True) != args.erase_apex:
+            raise ValueError('Resume requires the same apex erasing setting')
         saved_scale = checkpoint.get("appearance_lr_scale", 1.0)
         if saved_scale != args.appearance_lr_scale:
             raise ValueError("Resume requires the same appearance_lr_scale; start a new run for an LR ablation")
@@ -449,20 +437,24 @@ def run_fold(args, train_loader, val_loader, device, fold_tag=None):
         is_best = val_uf1 > best_val_uf1
 
         state = {
+            "erase_apex": args.erase_apex,
             "appearance_lr_scale": args.appearance_lr_scale,
             "scheduler_config": scheduler_config,
-            "architecture": "roi_tokens_fullface_v1",
+            "architecture": model.architecture,
             "model_config": model.model_config,
             "epoch":        epoch,
             "model":        model.state_dict(),
             "optimizer":    optimizer.state_dict(),
             "scheduler":    scheduler.state_dict(),
-            "best_val_acc": val_acc if is_best else best_val_acc,
+            "held_out_subject": fold_tag,
+            "best_val_acc": max(best_val_acc, val_acc),
             "best_val_uf1": best_val_uf1 if not is_best else val_uf1,
             "uar_at_best":  uar_at_best if not is_best else val_uar,
         }
 
         best_val_acc = max(best_val_acc, val_acc)
+        # Keep an actual last-epoch checkpoint, even when UF1 does not improve.
+        torch.save(state, resume_path)
 
         # save best ckpt (UF1 / macro-F1)
         if is_best:
@@ -554,19 +546,14 @@ def run_fold(args, train_loader, val_loader, device, fold_tag=None):
     if use_wandb:
         wandb.finish()
 
-    if os.path.exists(resume_path):
-        os.remove(resume_path)
-    for f in os.listdir(args.backup_dir):
-        if f.startswith(f"{tag_str}_4dme_epoch") and f.endswith(".pth"):
-            os.remove(os.path.join(args.backup_dir, f))
-        if f.startswith(f"{tag_str}_4dme_best") and f.endswith(".pth"):
-            os.remove(os.path.join(args.backup_dir, f))
+    # Retain last/best checkpoints so the completed fold can be evaluated.
 
     return best_val_acc, best_val_uf1, uar_at_best
 
 
 def main():
     args = get_args()
+    validate_model_args(args)
     get_scheduler_config(args)  # Fail before loading data for invalid schedule arguments.
     set_seed(args.seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
