@@ -133,6 +133,7 @@ class Block(nn.Module):
     def __init__(self, dim, in_chans, q_chanel, num_heads, mlp_ratio=4., qkv_bias=False, drop=0., attn_drop=0.,
                  drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm):
         super().__init__()
+        self.bidirectional = True
         self.norm1 = norm_layer(dim)
         self.img_chanel = in_chans + 1
         self.num_channels = in_chans + q_chanel + 2
@@ -162,9 +163,10 @@ class Block(nn.Module):
         x_img = x_img + self.drop_path(self.mlp1(self.norm2(x_img)))
 
 
-        lm_out, attn_lm = self.attn_lm(self.norm3(x))
-
-        x_lm = x_lm + self.drop_path(lm_out)
+        attn_lm = None
+        if self.bidirectional:
+            lm_out, attn_lm = self.attn_lm(self.norm3(x))
+            x_lm = x_lm + self.drop_path(lm_out)
         x_lm = x_lm + self.drop_path(self.mlp2(self.norm4(x_lm)))
 
         x = torch.cat((x_img, x_lm), dim=1)

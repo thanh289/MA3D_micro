@@ -142,7 +142,17 @@ def get_args():
                         choices=["online", "offline", "disabled"])
     parser.add_argument("--wandb_watch_model", action="store_true")
 
-    return parser.parse_args()
+    parser.add_argument("--ablation", default="full", choices=(
+        "full", "channel_film", "one_way_attention", "no_appearance", "no_mace",
+    ))
+    parser.add_argument("--fixed_final_epoch", action="store_true",
+                        help="Evaluate once, after the last training epoch.")
+    args = parser.parse_args()
+    if args.fixed_final_epoch and args.early_stop_on_perfect_val:
+        parser.error("--fixed_final_epoch cannot use held-out early stopping")
+    if args.fixed_final_epoch and args.resume:
+        parser.error("Start fixed-epoch runs without --resume")
+    return args
 
 
 def compute_extra_metrics(y_true, y_pred, num_classes):
@@ -265,14 +275,24 @@ def run_fold(args, train_loader, val_loader, device, fold_tag=None):
                   motion_backbone=args.motion_backbone,
                   use_au=args.use_au,
                   au_dim=args.au_dim,
-                  au_embed_dim=args.au_embed_dim).to(device)
+                  au_embed_dim=args.au_embed_dim,
+                  use_spatial_film=args.ablation != "channel_film",
+                  use_appearance=args.ablation != "no_appearance",
+                  bidirectional_attention=args.ablation != "one_way_attention").to(device)
+    parameter_counts = (
+        f"Parameters: total={sum(p.numel() for p in model.parameters()):,}, "
+        f"trainable={sum(p.numel() for p in model.parameters() if p.requires_grad):,}"
+    )
+    print(parameter_counts)
+    if log_f:
+        log_f.write(parameter_counts + "\n")
 
     if use_wandb and args.wandb_watch_model:
         wandb.watch(model, log="all", log_freq=100)
 
     CE_criterion  = torch.nn.CrossEntropyLoss()
     lsce_criterion = LabelSmoothingCrossEntropy(smoothing=0.2)
-    MA_criterion = MarginAwareCELoss().to(device)
+    MA_criterion = CE_criterion if args.ablation == "no_mace" else MarginAwareCELoss().to(device)
 
     base_optimizer = optim.AdamW
     # optimizer = SAM(model.parameters(), base_optimizer,
@@ -308,6 +328,10 @@ def run_fold(args, train_loader, val_loader, device, fold_tag=None):
             MA_criterion, optimizer, device, epoch, args.epochs,
             aux_loss_weight=args.aux_loss_weight,
         )
+
+        if args.fixed_final_epoch and epoch + 1 < args.epochs:
+            scheduler.step()
+            continue
 
         val_loss, val_acc, val_labels, val_preds = validate(
             model, val_loader, CE_criterion, device, epoch, args.epochs,
@@ -436,6 +460,8 @@ def run_fold(args, train_loader, val_loader, device, fold_tag=None):
     if os.path.exists(resume_path):
         os.remove(resume_path)
     for f in os.listdir(args.backup_dir):
+        if args.fixed_final_epoch and f == f"{tag_str}_4dme_best.pth":
+            continue
         if f.startswith(f"{tag_str}_4dme_epoch") and f.endswith(".pth"):
             os.remove(os.path.join(args.backup_dir, f))
         if f.startswith(f"{tag_str}_4dme_best") and f.endswith(".pth"):
@@ -488,6 +514,17 @@ def main():
         fold_accs = np.array(fold_accs)
         fold_uf1s = np.array(fold_uf1s)
         fold_uars = np.array(fold_uars)
+
+        if args.fixed_final_epoch:
+            labels, predictions = [], []
+            for _, _, held_out in splits:
+                labels.append(np.load(os.path.join(args.backup_dir, f"{held_out}_best_val_labels.npy")))
+                predictions.append(np.load(os.path.join(args.backup_dir, f"{held_out}_best_val_preds.npy")))
+            pooled_uf1, pooled_uar, _, _ = compute_extra_metrics(
+                np.concatenate(labels), np.concatenate(predictions), args.num_classes
+            )
+            print(f"Final-epoch pooled UF1={pooled_uf1:.4f} UAR={pooled_uar:.4f} "
+                  f"on {len(splits)} folds and {sum(map(len, labels))} clips")
 
         summary = (
             f"\n=== LOSO summary across {len(splits)} folds ===\n"

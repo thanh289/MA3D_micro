@@ -216,7 +216,8 @@ class MA3D(nn.Module):
                  n_roi=3, landmark_embed_dim=256, num_film_blocks=5,
                  use_spatial_film=True, use_rise_fall=True,
                  rise_fall_mode="feature_gate", motion_backbone="cnn",
-                 use_au=False, au_dim=36, au_embed_dim=128):
+                 use_au=False, au_dim=36, au_embed_dim=128,
+                 use_appearance=True, bidirectional_attention=True):
         super().__init__()
         depth = 8
         if type == "small":
@@ -252,9 +253,11 @@ class MA3D(nn.Module):
 
         # --- Appearance-context branch (Route C1: shallow ViT, trained from
         # scratch -- no checkpoint, no freezing; see class docstring) ---
-        self.appearance_encoder = AppearanceEncoderViT(
-            grid_size=7, embed_dim=512, depth=2, num_heads=4,
-        )
+        self.appearance_encoder = None
+        if use_appearance:
+            self.appearance_encoder = AppearanceEncoderViT(
+                grid_size=7, embed_dim=512, depth=2, num_heads=4,
+            )
 
         # --- Motion branch (trained from scratch) -- main content ---
         # SHARED weights: when use_rise_fall=True, this SAME instance is
@@ -298,9 +301,16 @@ class MA3D(nn.Module):
             )
 
         # --- Cross-attention + classification head (unchanged) ---
-        self.pyramid_fuse = HyVisionTransformer(in_chans=49, q_chanel=49, embed_dim=512,
-                                             depth=depth, num_heads=8, mlp_ratio=2.,
-                                             drop_rate=0., attn_drop_rate=0., drop_path_rate=0.1)
+        self.pyramid_fuse = None
+        if use_appearance:
+            self.pyramid_fuse = HyVisionTransformer(
+                in_chans=49, q_chanel=49, embed_dim=512, depth=depth,
+                num_heads=8, mlp_ratio=2., drop_rate=0., attn_drop_rate=0.,
+                drop_path_rate=0.1,
+            )
+            for block in self.pyramid_fuse.modules():
+                if isinstance(block, Block):
+                    block.bidirectional = bidirectional_attention
 
         self.se_block = SE_block(input_dim=512)
 
@@ -349,7 +359,10 @@ class MA3D(nn.Module):
         # argument (see hyp_crossvit.py -- x_class2 is computed but never
         # returned), so argument order matters: motion (the branch we want
         # driving the final decision) goes first, appearance-context second.
-        y_hat, attn_all = self.pyramid_fuse(x_motion, x_appear)
+        if self.pyramid_fuse is None:
+            y_hat, attn_all = x_motion.mean(dim=1), []
+        else:
+            y_hat, attn_all = self.pyramid_fuse(x_motion, x_appear)
         y_hat = self.se_block(y_hat)
 
         if au_embed is not None:
@@ -406,7 +419,9 @@ class MA3D(nn.Module):
 
         # --- Appearance-context branch (Route C1: shallow ViT, trained from
         # scratch), fed with ONSET ---
-        x_appear = self.appearance_encoder(x_onset)                 # [B, 49, 512]
+        x_appear = None
+        if self.appearance_encoder is not None:
+            x_appear = self.appearance_encoder(x_onset)
 
         aux = {"rise": None, "fall": None, "agreement": None}
 
